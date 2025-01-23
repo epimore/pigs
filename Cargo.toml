@@ -1,0 +1,3 @@
+[workspace]
+resolver = "2"
+members = ["common", "exception","macros/cfg_lib","macros/constructor"]

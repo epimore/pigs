@@ -1,0 +1,39 @@
+log:
+  level: debug #默认日志等级
+  prefix: server #默认日志文件前缀; eg:server_2024-10-26.log
+  store_path: ./logs
+  specify: #指定日志输出
+    - crate_name: sqlx  #sqlx用指全部，可sqlx::xxx
+      level: debug #日志等级
+      file_name_prefix: sql #日志文件前缀
+      additivity: false #是否记录到默认日志文件中
+
+db:
+  mysql:
+    host_or_ip: imysql
+    port: 33061
+    db_name: gmv
+    user: epimore
+    pass: clRXVjIzU1VrS3BEMXZmNxp5adMgQy599aQeu0tHYg0= #密码的密文
+    attrs:
+      log_global_sql_level: info #记录全局sql,默认debug,此处需小于或等于log.level才会被日志记录
+      log_slow_sql_timeout: 30 #以警告的等级记录超时30秒的sql,默认1秒
+      timezone: Asia/Shanghai
+      charset: utf8mb4
+      ssl_level: 0 #加密等级，默认1，取值[0,1]，0-不加密，1-可选加密：服务端支持则加密、否则不加密，2-必选加密，服务端不支持则不建立连接，3-满足2外还需验证主机名，4-满足2外还需验证CA证书
+      ssl_ca_crt_file: path/to/ca.crt #CA 证书 ssl_level:3 生效
+      ssl_ca_client_cert_file: path/to/client.crt #SSL 客户端证书 ssl_level:3 生效
+      ssl_ca_client_key_file: path/to/client.key #SSL 客户端密钥 ssl_level:3 生效
+    pool:
+      max_connections: 100  # 默认100，最大连接池值，即峰值时，操作进行排队
+      min_connections: 60   # 默认等同于max_size，最小连接池值，即空闲时也维持
+      connection_timeout: 30     # 默认8秒，连接超时时间(最大255)
+      max_lifetime: 1800     # 默认30 秒,连接最大存活时间
+      idle_timeout: 1800     # 默认8 秒，连接空闲回收
+      check_health: true    # 默认true，连接池维持健康测试
+  sqlite:
+    host_or_ip: imysql
+    port: 33061
+    db_name: idb_test
+    user: epimore
+    pass: clRXVjIzU1VrS3BEMXZmNxp5adMgQy599aQeu0tHYg0=
