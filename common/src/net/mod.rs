@@ -12,18 +12,6 @@ mod core;
 pub mod state;
 pub mod sdx;
 
-///todo 主动断开清理连接;创建事件句柄?封装数据枚举：EVENT-DATA
-// static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
-//     tokio::runtime::Builder::new_multi_thread()
-//         .thread_name_fn(|| {
-//             static ATOMIC_ID: AtomicUsize = AtomicUsize::new(0);
-//             let id = ATOMIC_ID.fetch_add(1, Ordering::SeqCst);
-//             format!("net-pool-{}", id)
-//         })
-//         .enable_all()
-//         .build()
-//         .hand_err(|msg| error!("net-pool Runtime build failed {msg}")).unwrap()
-// });
 #[cfg(feature = "net")]
 pub async fn init_net(protocol: state::Protocol, socket_addr: SocketAddr) -> GlobalResult<(Sender<Zip>, Receiver<Zip>)> {
     net_run(protocol, socket_addr).await

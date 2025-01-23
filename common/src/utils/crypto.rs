@@ -47,21 +47,27 @@ pub fn default_decrypt(data: &str) -> GlobalResult<String> {
     decrypt(DEFAULT_KEY, data)
 }
 
-#[test]
-fn t1() {
-    let plaintext = "hello world";
-    let key = "01234567012345670123456701234567";
-    let enc = encrypt(key, plaintext);
-    println!("{:?}", enc);
-    let dec = decrypt(key, &enc.unwrap());
-    println!("{:?}", dec);
-}
 
-#[test]
-fn t2() {
-    let plaintext = "Ms@2023%Kht";
-    let enc = default_encrypt(plaintext).unwrap();
-    let dec = default_decrypt(&enc).unwrap();
-    println!("dec = {},enc = {}", dec, enc);
-    println!("{}",default_decrypt("Zncyb25BdWFZQkhxZ3JHST/4t3MN5NMWNZT3HVjNxRY=").unwrap());
+#[cfg(test)]
+mod test{
+    use crate::utils::crypto::{decrypt, default_decrypt, default_encrypt, encrypt};
+
+    #[test]
+    fn t1() {
+        let plaintext = "hello world";
+        let key = "01234567012345670123456701234567";
+        let enc = encrypt(key, plaintext);
+        println!("{:?}", enc);
+        let dec = decrypt(key, &enc.unwrap());
+        println!("{:?}", dec);
+    }
+
+    #[test]
+    fn t2() {
+        let plaintext = "Ms@2023%Kht";
+        let enc = default_encrypt(plaintext).unwrap();
+        let dec = default_decrypt(&enc).unwrap();
+        println!("dec = {},enc = {}", dec, enc);
+        println!("{}",default_decrypt("Zncyb25BdWFZQkhxZ3JHST/4t3MN5NMWNZT3HVjNxRY=").unwrap());
+    }
 }
