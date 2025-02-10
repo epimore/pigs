@@ -53,7 +53,7 @@ pub fn get_conn_by_pool() -> GlobalResult<&'static Pool<MySql>> {
 }
 
 #[derive(Debug, Deserialize)]
-#[conf(prefix = "db.mysql",inner="")]
+#[conf(prefix = "db.mysql", lib)]
 struct DbModel {
     host_or_ip: String,
     port: u16,
@@ -97,7 +97,7 @@ impl DbModel {
                 Some(4) => {
                     conn_options = conn_options.ssl_mode(MySqlSslMode::VerifyCa);
                 }
-                Some(_other) => { panic!("连接无效加密等级:{other}") }
+                Some(other) => { panic!("连接无效加密等级:{other}") }
             }
             if let Some(ca) = attr.ssl_ca_crt_file {
                 conn_options = conn_options.ssl_ca(ca)
