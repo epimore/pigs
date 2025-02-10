@@ -1,12 +1,10 @@
-
-extern crate proc_macro;
-
-use proc_macro2::TokenTree;
-use quote::quote;
+use proc_macro2::{Ident, TokenTree};
+use quote::{format_ident, quote};
 use syn::{DeriveInput};
 use proc_macro::TokenStream;
+
 /// ```example
-/// #[conf(path="可选",prefix="可选",data_type="可选")]
+/// #[conf(path="可选",prefix="可选",data_type="可选",lib="可选",check=[true,false]可选)]
 /// struct T{ xxx}
 /// impl struct{
 ///   fn test()->Self{
@@ -19,27 +17,103 @@ use proc_macro::TokenStream;
 /// path:指定文件 默认读取配置文件;
 /// prefix: 指定字段数据 默认无;
 /// data_type: 文件类型 默认yaml,暂仅支持yaml;
+/// lib 指定yml与cfg_lib库。默认使用common
+///check 初始化struct时，默认None,不校验。some(true)开启自定义字段检查；需手动实现trait cfg_lib::CheckFromConf
 #[proc_macro_attribute]
 pub fn conf(attrs: TokenStream, item: TokenStream) -> TokenStream {
     let ast: DeriveInput = syn::parse(item).expect("syn parse item failed");
-    let attr = parse_attr(attrs);
-    let token_stream = build_fn_constructor(attr);
-    let name = &ast.ident;
+    let mut content = String::new();
+    let attr = parse_attr(attrs, &mut content);
+    println!("{:?}", &content);
+    println!("{:?}", &attr);
+    let struct_name = &ast.ident;
+    let register_constructor = build_register_constructor(&attr, struct_name);
+    let token_stream = build_conf_constructor(attr);
     let (i, t, w) = ast.generics.split_for_impl();
     let fun = quote! {
         #ast
-        impl #i #name #t #w {
+        impl #i #struct_name #t #w {
             #token_stream
         }
+        #register_constructor
     };
-    // println!("{}",&fun.to_string());
+    println!("{}", &fun.to_string());
     fun.into()
 }
 
-fn build_fn_constructor(attr: ConAttr) -> proc_macro2::TokenStream {
+fn build_register_constructor(attr: &ConAttr, struct_name: &Ident) -> proc_macro2::TokenStream {
+    let check = if attr.check {
+        quote! {
+                    #struct_name::conf()._field_check();
+                }
+    } else {
+        quote! {
+                   let _ = #struct_name::conf();
+                }
+    };
+    let reg_ins = format_ident!("register_instance_{}", camel_to_snake(struct_name.to_string().as_str()));
+    match &attr.lib {
+        None => quote! {
+            #[common::ctor::ctor]
+            fn #reg_ins() {
+               common::cfg_lib::conf::register_function(std::any::type_name::<#struct_name>(), || { #check });
+            }
+    },
+        Some(lib) if !lib.is_empty() => {
+            let lib_path: syn::Path = syn::parse_str(lib).expect("解析库路径失败");
+            quote! {
+            #[#lib_path::ctor::ctor]
+            fn #reg_ins() {
+               #lib_path::cfg_lib::conf::register_function(std::any::type_name::<#struct_name>(), || { #check });
+            }
+        }
+        }
+        _ => {
+            match attr.path {
+                None => {
+                    quote! {
+                        #[ctor::ctor]
+                        fn #reg_ins() {
+                            cfg_lib::conf::register_function(std::any::type_name::<#struct_name>(), || {  });
+                        }
+                    }
+                }
+                Some(_) => {
+                    quote! {
+                        #[ctor::ctor]
+                        fn #reg_ins() {
+                            #check
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn build_conf_constructor(attr: ConAttr) -> proc_macro2::TokenStream {
     let fn_body_path;
     let fn_body_prefix;
     let fn_body_data_type;
+    let fn_body_use_lib;
+
+    match attr.lib {
+        None => {
+            fn_body_use_lib = quote! {
+                use common::cfg_lib;
+                use common::serde_yaml;
+            };
+        }
+        Some(lib) => {
+            if !lib.is_empty() {
+                let lib_path: syn::Path = syn::parse_str(&lib).expect("解析库路径失败");
+                fn_body_use_lib = quote! {
+                use #lib_path::cfg_lib;
+                use #lib_path::serde_yaml;
+            };
+            } else { fn_body_use_lib = quote! {} }
+        }
+    }
 
     match attr.path {
         None => {
@@ -94,6 +168,7 @@ fn build_fn_constructor(attr: ConAttr) -> proc_macro2::TokenStream {
 
     quote! {
         fn conf() -> Self {
+            #fn_body_use_lib
             #fn_body_path
             #fn_body_prefix
             #fn_body_data_type
@@ -101,45 +176,68 @@ fn build_fn_constructor(attr: ConAttr) -> proc_macro2::TokenStream {
     }
 }
 
-fn parse_attr(attrs: TokenStream) -> ConAttr {
+fn parse_attr(attrs: TokenStream, content: &mut String) -> ConAttr {
     let args = proc_macro2::TokenStream::from(attrs);
     let mut attr = ConAttr::default();
     if args.is_empty() {
         return attr;
     }
-    let mut key = "".to_string();
+
+    let mut key = String::new();
     for arg in args {
         match arg {
-            TokenTree::Group(_) => {}
             TokenTree::Ident(ident) => {
                 key = ident.to_string();
+                if key.eq("lib") {
+                    attr.lib = Some("".to_string());
+                } else if key.eq("check") {
+                    attr.check = true;
+                }
+                content.push_str(" key=");
+                content.push_str(&key);
             }
-            TokenTree::Punct(_) => {}
+            TokenTree::Punct(_) => {} // 逗号等符号忽略
             TokenTree::Literal(lit) => {
-                let value = lit.to_string().trim_matches('"').to_string(); // 去掉引号
-                match &*key {
-                    "path" => {
-                        attr.path = Some(value);
-                    }
-                    "prefix" => {
-                        attr.prefix = Some(value);
-                    }
-                    "data_type" => {
-                        attr.data_type = Some(value.to_uppercase());
-                    }
-                    other => {
-                        panic!("invalid attr name: {}", other);
-                    }
+                let lit_str = lit.to_string();
+                content.push_str(" value=");
+                content.push_str(&lit_str);
+                let value = lit_str.trim_matches('"').to_string();
+                match key.as_str() {
+                    "lib" => attr.lib = Some(value),
+                    "path" => attr.path = Some(value),
+                    "prefix" => attr.prefix = Some(value),
+                    "data_type" => attr.data_type = Some(value.to_uppercase()),
+                    other => panic!("invalid attr name: {}", other),
                 }
             }
+            _ => panic!("Unsupported token in attributes"),
         }
     }
     attr
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct ConAttr {
     path: Option<String>,
     prefix: Option<String>,
     data_type: Option<String>,
+    lib: Option<String>,
+    check: bool,
+}
+
+fn camel_to_snake(s: &str) -> String {
+    let mut snake_case = String::new();
+
+    for (i, c) in s.chars().enumerate() {
+        if c.is_uppercase() {
+            if i > 0 {
+                snake_case.push('_');
+            }
+            snake_case.push(c.to_ascii_lowercase());
+        } else {
+            snake_case.push(c);
+        }
+    }
+
+    snake_case
 }
