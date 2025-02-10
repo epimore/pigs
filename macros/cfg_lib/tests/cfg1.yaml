@@ -2,4 +2,4 @@ name: "My Application"
 version: v1.0
 features:
   logging: true
-  metrics: false
+  metrics: true

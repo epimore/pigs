@@ -53,7 +53,7 @@ pub fn get_conn_by_pool() -> GlobalResult<&'static Pool<MySql>> {
 }
 
 #[derive(Debug, Deserialize)]
-#[conf(prefix = "db.mysql")]
+#[conf(prefix = "db.mysql",inner="")]
 struct DbModel {
     host_or_ip: String,
     port: u16,

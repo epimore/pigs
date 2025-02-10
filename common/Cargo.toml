@@ -35,6 +35,7 @@ hex-literal = "0.2.1"
 rand = "0.8.4"
 bytebuffer = "0.2.1"
 base64 = "0.13.0"
+ctor = "0.2"
 
 
 [dev-dependencies]

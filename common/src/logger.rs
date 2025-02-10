@@ -30,7 +30,7 @@ use crate::serde_default;
 ///       additivity: true #是否记录到全局日志文件中
 ///  ```
 #[derive(Debug, Deserialize)]
-#[conf(prefix = "log")]
+#[conf(prefix = "log", lib)]
 pub struct Logger {
     #[serde(default)]
     store_path: PathBuf,

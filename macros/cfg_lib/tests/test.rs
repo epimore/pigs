@@ -1,31 +1,16 @@
-#[allow(dead_code)]
+#[allow(dead_code,unused_imports)]
 mod test1 {
     use serde::Deserialize;
-    use cfg_lib::conf::init_cfg;
+    use cfg_lib::conf::{CheckFromConf, init_cfg};
     use cfg_macro::conf;
 
 
     #[derive(Debug, Deserialize)]
-    #[conf]
+    #[conf(lib)]
     struct Cfg1 {
         name: String,
         version: String,
         features: Features,
-    }
-
-    #[derive(Debug, Deserialize)]
-    #[conf(path = "tests/cfg1.yaml")]
-    struct Cfg2 {
-        name: String,
-        version: String,
-        features: Features,
-    }
-
-    #[derive(Debug, Deserialize)]
-    #[conf(path = "tests/cfg1.yaml", prefix = "features")]
-    struct Features {
-        logging: bool,
-        metrics: bool,
     }
 
     #[test]
@@ -35,11 +20,35 @@ mod test1 {
         println!("{:?}", conf);
     }
 
+    #[derive(Debug, Deserialize)]
+    #[conf(path = "tests/cfg1.yaml", lib)]
+    struct Cfg2 {
+        name: String,
+        version: String,
+        features: Features,
+    }
+
     #[test]
     fn test_target_conf2() {
         let conf = Cfg2::conf();
         println!("{:?}", conf);
     }
+
+    #[derive(Debug, Deserialize)]
+    // #[conf(path = "tests/cfg1.yaml", prefix = "features", lib, check)]
+    #[conf(path = "tests/cfg1.yaml", prefix = "features", lib)]
+    struct Features {
+        logging: bool,
+        metrics: bool,
+    }
+
+    // impl CheckFromConf for Features {
+    //     fn _field_check(&self) {
+    //         if self.logging && self.metrics {
+    //             panic!("all true");
+    //         }
+    //     }
+    // }
 
     #[test]
     fn test_prefix_conf() {
@@ -47,3 +56,4 @@ mod test1 {
         println!("{:?}", conf);
     }
 }
+

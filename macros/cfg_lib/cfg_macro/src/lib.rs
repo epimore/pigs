@@ -22,10 +22,7 @@ use proc_macro::TokenStream;
 #[proc_macro_attribute]
 pub fn conf(attrs: TokenStream, item: TokenStream) -> TokenStream {
     let ast: DeriveInput = syn::parse(item).expect("syn parse item failed");
-    let mut content = String::new();
-    let attr = parse_attr(attrs, &mut content);
-    println!("{:?}", &content);
-    println!("{:?}", &attr);
+    let attr = parse_attr(attrs);
     let struct_name = &ast.ident;
     let register_constructor = build_register_constructor(&attr, struct_name);
     let token_stream = build_conf_constructor(attr);
@@ -37,7 +34,7 @@ pub fn conf(attrs: TokenStream, item: TokenStream) -> TokenStream {
         }
         #register_constructor
     };
-    println!("{}", &fun.to_string());
+    // println!("{}", &fun.to_string());
     fun.into()
 }
 
@@ -176,7 +173,7 @@ fn build_conf_constructor(attr: ConAttr) -> proc_macro2::TokenStream {
     }
 }
 
-fn parse_attr(attrs: TokenStream, content: &mut String) -> ConAttr {
+fn parse_attr(attrs: TokenStream) -> ConAttr {
     let args = proc_macro2::TokenStream::from(attrs);
     let mut attr = ConAttr::default();
     if args.is_empty() {
@@ -193,14 +190,10 @@ fn parse_attr(attrs: TokenStream, content: &mut String) -> ConAttr {
                 } else if key.eq("check") {
                     attr.check = true;
                 }
-                content.push_str(" key=");
-                content.push_str(&key);
             }
             TokenTree::Punct(_) => {} // 逗号等符号忽略
             TokenTree::Literal(lit) => {
                 let lit_str = lit.to_string();
-                content.push_str(" value=");
-                content.push_str(&lit_str);
                 let value = lit_str.trim_matches('"').to_string();
                 match key.as_str() {
                     "lib" => attr.lib = Some(value),
