@@ -55,7 +55,9 @@ pub fn init_cfg(path: String) {
         }
     }
     if err_msg.len() > 0 {
-        panic!("{}", err_msg);
+        eprintln!("ERR: {}", err_msg);
+        eprintln!("   ...init service config failed.\n      ...start service failed.");
+        std::process::exit(1);
     }
 }
 
