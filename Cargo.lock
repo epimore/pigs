@@ -355,9 +355,16 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "sqlx",
  "tokio",
  "users",
+]
+
+[[package]]
+name = "common_db"
+version = "0.1.0"
+dependencies = [
+ "common",
+ "sqlx",
 ]
 
 [[package]]

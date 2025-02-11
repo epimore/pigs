@@ -41,11 +41,14 @@ pub fn conf(attrs: TokenStream, item: TokenStream) -> TokenStream {
 fn build_register_constructor(attr: &ConAttr, struct_name: &Ident) -> proc_macro2::TokenStream {
     let check = if attr.check {
         quote! {
-                    #struct_name::conf()._field_check();
+                    #struct_name::conf()._field_check()
                 }
     } else {
         quote! {
-                   let _ = #struct_name::conf();
+                   {
+                       let _ = #struct_name::conf();
+                       Ok(())
+                   }
                 }
     };
     let reg_ins = format_ident!("register_instance_{}", camel_to_snake(struct_name.to_string().as_str()));
@@ -71,15 +74,16 @@ fn build_register_constructor(attr: &ConAttr, struct_name: &Ident) -> proc_macro
                     quote! {
                         #[ctor::ctor]
                         fn #reg_ins() {
-                            cfg_lib::conf::register_function(std::any::type_name::<#struct_name>(), || {  });
+                            cfg_lib::conf::register_function(std::any::type_name::<#struct_name>(), || #check);
                         }
                     }
                 }
                 Some(_) => {
                     quote! {
                         #[ctor::ctor]
-                        fn #reg_ins() {
-                            #check
+                        fn #reg_ins(){
+                            let res:Result<(), cfg_lib::conf::FieldCheckError> = #check;
+                            res.expect("实例化配置文件失败");
                         }
                     }
                 }

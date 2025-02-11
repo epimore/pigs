@@ -7,15 +7,35 @@ use clap::{Arg, ArgMatches, Command};
 use once_cell::sync::{Lazy, OnceCell};
 
 static CONF: OnceCell<Arc<String>> = OnceCell::new();
-static INSTANCES: Lazy<Mutex<HashMap<String, fn()>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static INSTANCES: Lazy<Mutex<HashMap<String, Box<dyn Fn() -> Result<(), FieldCheckError> +Send>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+
+#[derive(Debug)]
+pub enum FieldCheckError {
+    BizError(String), //业务错误
+}
+
+impl std::fmt::Display for FieldCheckError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FieldCheckError::BizError(msg) => write!(f, "{}", msg),
+        }
+    }
+}
+
+impl std::error::Error for FieldCheckError {}
 
 /// 通过配置文件初始化时，
 /// 校验struct字段
-pub trait CheckFromConf{
-    fn _field_check(&self);
+pub trait CheckFromConf {
+    fn _field_check(&self) -> Result<(), FieldCheckError>;
 }
-pub fn register_function(name: &str, func: fn()) {
-    INSTANCES.lock().unwrap().insert(name.to_string(), func);
+
+pub fn register_function<F>(name: &str, func: F)
+where
+    F: Fn() -> Result<(), FieldCheckError> + 'static + Send,
+{
+    INSTANCES.lock().unwrap().insert(name.to_string(), Box::new(func));
 }
 
 pub fn get_config() -> Arc<String> {
@@ -27,9 +47,15 @@ pub fn init_cfg(path: String) {
     let mut conf = String::new();
     file.read_to_string(&mut conf).expect("read file content to string failed");
     CONF.set(Arc::new(conf)).expect("form config of service has been initialized");
+    let mut err_msg = String::new();
     //校验配置文件conf初始化类型是否正确
-    for (_name, func) in INSTANCES.lock().unwrap().iter() {
-        func();
+    for (name, func) in INSTANCES.lock().unwrap().iter() {
+        if let Err(err) = func() {
+            err_msg.push_str(&format!("{}: {}\n", name, err).to_string());
+        }
+    }
+    if err_msg.len() > 0 {
+        panic!("{}", err_msg);
     }
 }
 

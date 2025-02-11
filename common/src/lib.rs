@@ -23,10 +23,5 @@ pub use exception::anyhow;
 
 #[cfg(feature = "net")]
 pub mod net;
-#[cfg(feature = "mysqlx")]
-pub mod dbx;
 pub mod daemon;
-
-#[cfg(feature = "mysqlx")]
-pub use sqlx;
 

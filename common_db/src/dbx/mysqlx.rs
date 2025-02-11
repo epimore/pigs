@@ -1,17 +1,17 @@
 use std::time::Duration;
 
-use log::{error, LevelFilter};
-use once_cell::sync::OnceCell;
-use serde::Deserialize;
+use common::log::{error, LevelFilter};
+use common::once_cell::sync::OnceCell;
+use common::serde::Deserialize;
 use sqlx::{Connection, ConnectOptions, MySql, Pool};
 use sqlx::mysql::MySqlSslMode;
 use sqlx::pool::PoolOptions;
 
-use cfg_lib::{conf};
-use exception::{GlobalError, GlobalResult};
+use common::cfg_lib::{conf};
+use common::exception::{GlobalError, GlobalResult};
 
-use crate::{logger, serde_default};
-use crate::utils::crypto::{default_decrypt};
+use common::{logger, serde_default};
+use common::utils::crypto::{default_decrypt};
 /*
 Rust type	MySQL/MariaDB type(s)
 bool	TINYINT(1), BOOLEAN, BOOL (see below)
@@ -36,7 +36,6 @@ Duration	TIME (for decoding positive values only)
 static MYSQL_POOL: OnceCell<Pool<MySql>> = OnceCell::new();
 
 
-#[cfg(feature = "mysqlx")]
 pub fn init_conn_pool() -> GlobalResult<()> {
     let pool_conn = DbModel::build_pool_conn();
     MYSQL_POOL.set(pool_conn)
@@ -46,14 +45,14 @@ pub fn init_conn_pool() -> GlobalResult<()> {
     Ok(())
 }
 
-#[cfg(feature = "mysqlx")]
 pub fn get_conn_by_pool() -> GlobalResult<&'static Pool<MySql>> {
     let conn_pool = MYSQL_POOL.get().ok_or_else(|| GlobalError::new_sys_error("the mysql connection pool has not been initialized", |msg| error!("{msg}")))?;
     Ok(conn_pool)
 }
 
 #[derive(Debug, Deserialize)]
-#[conf(prefix = "db.mysql", lib)]
+#[conf(prefix = "db.mysql")]
+#[serde(crate = "common::serde")]
 struct DbModel {
     host_or_ip: String,
     port: u16,
@@ -114,6 +113,7 @@ impl DbModel {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(crate = "common::serde")]
 struct AttrsModel {
     log_global_sql_level: Option<String>,
     log_slow_sql_timeout: Option<u16>,
@@ -126,6 +126,7 @@ struct AttrsModel {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(crate = "common::serde")]
 struct PoolModel {
     #[serde(default = "default_max_connections")]
     max_connections: u32,
