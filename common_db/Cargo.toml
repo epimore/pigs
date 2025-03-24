@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 common = {path = "../common"}
-sqlx = { version = "0.8", features = ["mysql", "runtime-tokio-native-tls", "default","chrono"] }
+sqlx = { version = "0.8", features = ["mysql","tls-rustls", "default","chrono"] }
 
 
 [features]
