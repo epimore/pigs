@@ -19,10 +19,11 @@ pub fn en(digit_str: &str) -> GlobalResult<String> {
     }
     let remainder = tmp_key0.len() % 9;
     let pad_len = 9 - remainder;
+    let mut header = A_DIC[0];
     if remainder != 0 {
         tmp_key0 = format!("{}{}", "0".repeat(pad_len), tmp_key0);
+        header = A_DIC[pad_len];
     }
-    let header = A_DIC[pad_len];
     let mut dst_key = String::new();
     dst_key.push(header);
     for chunk in tmp_key0.chars().collect::<Vec<_>>().chunks(9) {
