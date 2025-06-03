@@ -3,11 +3,11 @@ use std::fs::File;
 use std::io::Read;
 use std::sync::{Arc, Mutex};
 
-use clap::{Arg, ArgMatches, Command};
+use clap::{Arg, ArgAction, ArgMatches, Command};
 use once_cell::sync::{Lazy, OnceCell};
 
 static CONF: OnceCell<Arc<String>> = OnceCell::new();
-static INSTANCES: Lazy<Mutex<HashMap<String, Box<dyn Fn() -> Result<(), FieldCheckError> +Send>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static INSTANCES: Lazy<Mutex<HashMap<String, Box<dyn Fn() -> Result<(), FieldCheckError> + Send>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 
 #[derive(Debug)]
@@ -75,6 +75,11 @@ pub fn get_arg_match() -> ArgMatches {
                     .help("Path to configuration file")
                     .default_value("./config.yml")
                 )
+                .arg(Arg::new("daemon")
+                    .short('d')
+                    .long("daemon")
+                    .help("Run as a daemon")
+                    .action(ArgAction::SetTrue))
         )
         .subcommand(
             Command::new("stop")
@@ -83,12 +88,6 @@ pub fn get_arg_match() -> ArgMatches {
         .subcommand(
             Command::new("restart")
                 .about("Restart the service")
-                .arg(Arg::new("config")
-                    .short('c')
-                    .long("config")
-                    .help("Path to configuration file")
-                    .default_value("./config.yml")
-                )
         )
         .get_matches()
 }

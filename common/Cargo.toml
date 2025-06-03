@@ -23,7 +23,6 @@ constructor = { path = "../macros/constructor" }
 cfg_lib = { path = "../macros/cfg_lib" }
 exception = { path = "../exception" }
 #ctrlc = "3.4"
-daemonize = "0.5"
 users = "0.11"
 #nix = {version = "0.29",features = ["fs","signal"]}
 libc = "0.2"
@@ -37,6 +36,13 @@ base64 = "0.13.0"
 ctor = "0.2"
 hex = "0.4"
 sha2 = "0.10"
+
+# Unix-like 系统（Linux + macOS）
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+daemonize = "0.5"
+## Windows 特有依赖
+#[target.'cfg(target_os = "windows")'.dependencies]
+#windows-service = "0.8.0"
 [dev-dependencies]
 serde_json = "1.0.124"
 
