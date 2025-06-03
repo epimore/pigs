@@ -61,7 +61,10 @@ where
             };
             if daemon {
                 if cfg!(target_os = "linux") || cfg!(target_os = "macos") {
-                    unix::start_service::<D, T>();
+                    #[cfg(unix)]
+                    {
+                        unix::start_service::<D, T>();
+                    }
                 } else {
                     eprintln!("The daemon only supports macOS, and Linux");
                     match D::init_privilege() {
@@ -91,7 +94,10 @@ where
                 eprintln!("Not running daemon mode");
             } else {
                 if cfg!(target_os = "linux") || cfg!(target_os = "macos") {
-                    unix::stop_service();
+                    #[cfg(unix)]
+                    {
+                        unix::stop_service();
+                    }
                 } else {
                     eprintln!("The daemon only supports macOS, and Linux");
                 }
@@ -105,7 +111,10 @@ where
                 let config_path = daemon_meta.config_path;
                 cfg_lib::conf::init_cfg(config_path);
                 if cfg!(target_os = "linux") || cfg!(target_os = "macos") {
-                    unix::restart_service::<D, T>();
+                    #[cfg(unix)]
+                    {
+                        unix::restart_service::<D, T>();
+                    }
                 } else {
                     eprintln!("The daemon only supports macOS, and Linux");
                 }
