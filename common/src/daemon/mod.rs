@@ -23,7 +23,7 @@ struct DaemonMeta {
 impl DaemonMeta {
     fn get_meta_file_path() -> PathBuf {
         let exe_path = env::current_exe().expect("Failed to get current exe path");
-        exe_path.with_extension("meta.json")
+        exe_path.with_extension("meta")
     }
 
     fn save_meta(&self) {
@@ -59,6 +59,7 @@ where
                 config_path,
                 daemon,
             };
+            meta.save_meta();
             if daemon {
                 if cfg!(target_os = "linux") || cfg!(target_os = "macos") {
                     #[cfg(unix)]
@@ -86,13 +87,10 @@ where
                     }
                 }
             }
-            meta.save_meta();
         }
         Some(("stop", _)) => {
             let daemon_meta = DaemonMeta::load_meta();
             if daemon_meta.daemon {
-                eprintln!("Not running daemon mode");
-            } else {
                 if cfg!(target_os = "linux") || cfg!(target_os = "macos") {
                     #[cfg(unix)]
                     {
@@ -101,13 +99,13 @@ where
                 } else {
                     eprintln!("The daemon only supports macOS, and Linux");
                 }
+            } else {
+                eprintln!("Not running daemon mode");
             }
         }
         Some(("restart", _)) => {
             let daemon_meta = DaemonMeta::load_meta();
             if daemon_meta.daemon {
-                eprintln!("Not running daemon mode");
-            } else {
                 let config_path = daemon_meta.config_path;
                 cfg_lib::conf::init_cfg(config_path);
                 if cfg!(target_os = "linux") || cfg!(target_os = "macos") {
@@ -118,6 +116,8 @@ where
                 } else {
                     eprintln!("The daemon only supports macOS, and Linux");
                 }
+            } else {
+                eprintln!("Not running daemon mode");
             }
         }
         _other => {
