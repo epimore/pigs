@@ -6,6 +6,9 @@ use std::{
 use dashmap::DashMap;
 use tokio::sync::broadcast;
 use tokio::time::{timeout, Duration};
+use exception::typed::common::MessageBusError;
+
+const DEFAULT_CHANNEL_SIZE: usize = 64;
 
 #[derive(Clone)]
 pub struct TypedMessageBus {
@@ -25,7 +28,7 @@ impl TypedMessageBus {
     {
         let type_id = TypeId::of::<T>();
         let entry = self.channels.entry(type_id).or_insert_with(|| {
-            let (tx, _) = broadcast::channel(1024);
+            let (tx, _) = broadcast::channel(DEFAULT_CHANNEL_SIZE);
             tx
         });
         entry.send(Arc::new(msg))
@@ -38,7 +41,6 @@ impl TypedMessageBus {
         self.publish(msg.clone())
     }
 
-
     pub fn subscribe<T>(&self) -> TypedReceiver<T>
     where
         T: Send + Sync + 'static + Clone,
@@ -48,7 +50,7 @@ impl TypedMessageBus {
             .channels
             .entry(type_id)
             .or_insert_with(|| {
-                let (tx, _) = broadcast::channel(1024);
+                let (tx, _) = broadcast::channel(DEFAULT_CHANNEL_SIZE);
                 tx
             })
             .clone();
@@ -89,32 +91,36 @@ impl<T> TypedReceiver<T>
 where
     T: Send + Sync + 'static + Clone,
 {
-    pub fn try_recv(&mut self) -> Result<Option<T>, broadcast::error::TryRecvError> {
+    pub fn try_recv(&mut self) -> Result<T, MessageBusError> {
         match self.inner.try_recv() {
             Ok(arc) => Self::try_cast(arc),
-            Err(e) => Err(e),
+            Err(broadcast::error::TryRecvError::Closed) => Err(MessageBusError::ChannelClosed),
+            Err(broadcast::error::TryRecvError::Empty) => Err(MessageBusError::Timeout),
+            Err(broadcast::error::TryRecvError::Lagged(_)) => Err(MessageBusError::Lagged),
         }
     }
 
-    pub async fn recv(&mut self) -> Result<Option<T>, broadcast::error::RecvError> {
+    pub async fn recv(&mut self) -> Result<T, MessageBusError> {
         match self.inner.recv().await {
             Ok(arc) => Self::try_cast(arc),
-            Err(e) => Err(e),
+            Err(broadcast::error::RecvError::Closed) => Err(MessageBusError::ChannelClosed),
+            Err(broadcast::error::RecvError::Lagged(_)) => Err(MessageBusError::Lagged),
         }
     }
 
-    pub async fn recv_with_timeout(&mut self, dur: Duration) -> Result<Option<T>, broadcast::error::RecvError> {
+    pub async fn recv_with_timeout(&mut self, dur: Duration) -> Result<T, MessageBusError> {
         match timeout(dur, self.inner.recv()).await {
             Ok(Ok(arc)) => Self::try_cast(arc),
-            Ok(Err(e)) => Err(e),
-            Err(_) => Ok(None),
+            Ok(Err(broadcast::error::RecvError::Closed)) => Err(MessageBusError::ChannelClosed),
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => Err(MessageBusError::Lagged),
+            Err(_) => Err(MessageBusError::Timeout),
         }
     }
 
-    fn try_cast<E>(arc: Arc<dyn Any + Send + Sync>) -> Result<Option<T>, E> {
+    fn try_cast(arc: Arc<dyn Any + Send + Sync>) -> Result<T, MessageBusError> {
         match Arc::downcast::<T>(arc) {
-            Ok(val) => Ok(Some((*val).clone())),
-            Err(_) => Ok(None),
+            Ok(val) => Ok((*val).clone()),
+            Err(_) => Err(MessageBusError::TypeMismatch),
         }
     }
 }

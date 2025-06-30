@@ -1,4 +1,5 @@
 pub mod code;
+pub mod typed;
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};

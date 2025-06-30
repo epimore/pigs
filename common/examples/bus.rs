@@ -1,7 +1,7 @@
 
 use std::{time::Duration};
 use tokio::time::sleep;
-use common::bus::dataway::TypedMessageBus;
+use common::bus::broadcast::TypedMessageBus;
 
 #[tokio::main]
 async fn main() {
@@ -10,7 +10,7 @@ async fn main() {
     // 订阅者1：监听字符串
     let mut sub_str = bus.subscribe::<String>();
     tokio::spawn(async move {
-        while let Ok(Some(msg)) = sub_str.recv().await {
+        while let Ok(msg) = sub_str.recv().await {
             println!("[str] received: {}", msg);
         }
     });
@@ -18,7 +18,7 @@ async fn main() {
     // 订阅者2：监听 u32
     let mut sub_u32 = bus.subscribe::<u32>();
     tokio::spawn(async move {
-        while let Ok(Some(msg)) = sub_u32.recv().await {
+        while let Ok(msg) = sub_u32.recv().await {
             println!("[u32] received: {}", msg);
         }
     });
@@ -27,7 +27,7 @@ async fn main() {
     let mut sub_user = bus.subscribe::<User>();
     let mut sub_user1 = bus.subscribe::<User>();
     tokio::spawn(async move {
-        while let Ok(Some(user)) = sub_user.recv().await {
+        while let Ok(user) = sub_user.recv().await {
             println!("[User] received: {:?}", user);
         }
     });
