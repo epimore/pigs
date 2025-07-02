@@ -4,9 +4,9 @@ use std::{
 };
 
 use dashmap::DashMap;
+use exception::typed::common::MessageBusError;
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
-use exception::typed::common::MessageBusError;
 
 const DEFAULT_CHANNEL_SIZE: usize = 64;
 
@@ -21,15 +21,22 @@ impl TypedMessageBus {
         }
     }
 
+    pub fn add_type_channel<T>(&self) -> TypedReceiver<T>
+    where
+        T: Send + Sync + 'static,
+    {
+        let (tx, rx) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
+        let type_id = TypeId::of::<T>();
+        self.channels.insert(type_id, tx);
+        TypedReceiver::new(rx)
+    }
+
     pub fn try_publish<T>(&self, msg: T) -> Result<(), MessageBusError>
     where
         T: Send + Sync + 'static,
     {
         let type_id = TypeId::of::<T>();
-        let entry = self.channels.entry(type_id).or_insert_with(|| {
-            let (tx, _) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
-            tx
-        });
+        let entry = self.channels.get(&type_id).ok_or(MessageBusError::NotFound)?;
         entry
             .try_send(Box::new(msg))
             .map_err(|err| match err {
@@ -43,10 +50,7 @@ impl TypedMessageBus {
         T: Send + Sync + 'static,
     {
         let type_id = TypeId::of::<T>();
-        let entry = self.channels.entry(type_id).or_insert_with(|| {
-            let (tx, _) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
-            tx
-        });
+        let entry = self.channels.get(&type_id).ok_or(MessageBusError::NotFound)?;
         entry
             .send(Box::new(msg))
             .await

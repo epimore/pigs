@@ -12,4 +12,6 @@ pub enum MessageBusError {
     TypeMismatch,
     #[error("消息滞后")]
     Lagged,
+    #[error("通道不存在")]
+    NotFound,
 }
