@@ -6,9 +6,9 @@ use exception::typed::common::MessageBusError;
 #[tokio::main]
 async fn main() {
     let bus = TypedMessageBus::new();
-    let mut str_receiver = bus.add_type_channel::<String>();
-    let mut user_receiver = bus.add_type_channel::<User>();
-    let mut u8_receiver = bus.add_type_channel::<u8>();
+    let mut str_receiver = bus.sub_type_channel::<String>().unwrap();
+    let mut user_receiver = bus.sub_type_channel::<User>().unwrap();
+    let mut u8_receiver = bus.sub_type_channel::<u8>().unwrap();
     tokio::spawn(async move {
         if let Ok(msg) = str_receiver.recv().await {
             println!("[str] received: {}", msg);

@@ -4,6 +4,7 @@ use std::{
 };
 
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use exception::typed::common::MessageBusError;
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
@@ -21,14 +22,21 @@ impl TypedMessageBus {
         }
     }
 
-    pub fn add_type_channel<T>(&self) -> TypedReceiver<T>
+    pub fn sub_type_channel<T>(&self) -> Result<TypedReceiver<T>, MessageBusError>
     where
         T: Send + Sync + 'static,
     {
-        let (tx, rx) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
+        let (tx, rx) = mpsc::channel::<Box<dyn Any + Send + Sync>>(DEFAULT_CHANNEL_SIZE);
         let type_id = TypeId::of::<T>();
-        self.channels.insert(type_id, tx);
-        TypedReceiver::new(rx)
+        match self.channels.entry(type_id) {
+            Entry::Occupied(_) => {
+                Err(MessageBusError::AlreadyExists)
+            }
+            Entry::Vacant(val) => {
+                val.insert(tx);
+                Ok(TypedReceiver::new(rx))
+            }
+        }
     }
 
     pub fn try_publish<T>(&self, msg: T) -> Result<(), MessageBusError>
