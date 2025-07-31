@@ -4,6 +4,8 @@ use thiserror::Error;
 pub enum MessageBusError {
     #[error("通道已满")]
     Full,
+    #[error("通道为空")]
+    Empty,
     #[error("等待消息超时")]
     Timeout,
     #[error("通道已关闭")]
@@ -16,16 +18,4 @@ pub enum MessageBusError {
     NotFound,
     #[error("通道已存在")]
     AlreadyExists,
-}
-
-#[derive(Error, Debug)]
-pub enum RpcError {
-    #[error("io error: {0}")]
-    Io(String),
-    #[error("timeout")]
-    Timeout,
-    #[error("remote error: {0}")]
-    Remote(String),
-    #[error("unknown error")]
-    Unknown,
 }

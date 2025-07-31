@@ -85,7 +85,7 @@ where
         match self.inner.try_recv() {
             Ok(bo) => Self::try_cast(bo),
             Err(e) => match e {
-                mpsc::error::TryRecvError::Empty => Err(MessageBusError::Timeout),
+                mpsc::error::TryRecvError::Empty => Err(MessageBusError::Empty),
                 mpsc::error::TryRecvError::Disconnected => Err(MessageBusError::ChannelClosed),
             },
         }

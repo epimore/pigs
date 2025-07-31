@@ -95,7 +95,7 @@ where
         match self.inner.try_recv() {
             Ok(arc) => Self::try_cast(arc),
             Err(broadcast::error::TryRecvError::Closed) => Err(MessageBusError::ChannelClosed),
-            Err(broadcast::error::TryRecvError::Empty) => Err(MessageBusError::Timeout),
+            Err(broadcast::error::TryRecvError::Empty) => Err(MessageBusError::Empty),
             Err(broadcast::error::TryRecvError::Lagged(_)) => Err(MessageBusError::Lagged),
         }
     }
