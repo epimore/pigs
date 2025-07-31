@@ -3,7 +3,7 @@ use std::net::{TcpListener, UdpSocket};
 use log::error;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::{Receiver, Sender};
-use exception::{GlobalError, GlobalResult, TransError};
+use exception::{GlobalError, GlobalResult, GlobalResultExt};
 use crate::net::state::{CHANNEL_BUFFER_SIZE, Gate, GateListener, Protocol, Zip};
 use crate::net::{tcp, udp};
 

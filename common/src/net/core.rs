@@ -4,7 +4,7 @@ use tokio::{io};
 use crate::net::state::{Zip, Gate, GateListener, GateAccept, Protocol, CHANNEL_BUFFER_SIZE, TCP_HANDLE_MAP};
 use crate::net::{tcp, udp};
 use log::{error, warn};
-use crate::exception::{GlobalResult, TransError};
+use crate::exception::{GlobalResult, GlobalResultExt};
 use tokio::sync::{mpsc, oneshot};
 use tokio::sync::mpsc::{Receiver, Sender};
 use exception::GlobalError;

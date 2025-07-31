@@ -5,7 +5,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::{io, time};
 use crate::net::state::{Zip, Gate, GateListener, GateAccept, SOCKET_BUFFER_SIZE, Association, Protocol, TCP_HANDLE_MAP, Package, Event};
 use log::{error, debug, info};
-use crate::exception::{GlobalResult, TransError};
+use crate::exception::{GlobalResult, GlobalResultExt};
 use bytes::Bytes;
 use std::io::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

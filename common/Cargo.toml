@@ -8,7 +8,7 @@ edition = "2021"
 [dependencies]
 #anyhow = "1.0"
 #thiserror = "1.0"
-log = "0.4"
+log = { workspace = true }
 fern = { version = "0.6", features = ["date-based"] }
 chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1.36", features = ["full"] }

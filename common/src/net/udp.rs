@@ -1,6 +1,6 @@
 use tokio::sync::mpsc::{Sender, Receiver};
 use log::{debug, error, info, warn};
-use crate::exception::{GlobalResult, TransError};
+use crate::exception::{GlobalResult, GlobalResultExt};
 use crate::net::state::{Zip, Gate, GateListener, GateAccept, SOCKET_BUFFER_SIZE, Association, Protocol, Package};
 use tokio::net::UdpSocket;
 use std::net::SocketAddr;

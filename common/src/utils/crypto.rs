@@ -5,7 +5,7 @@ use log::error;
 use rand::seq::SliceRandom;
 use sha2::{Digest, Sha256};
 
-use exception::{GlobalResult, TransError};
+use exception::{GlobalResult, GlobalResultExt};
 
 type AesCbc = Cbc<Aes256, Pkcs7>;
 

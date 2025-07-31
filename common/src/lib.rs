@@ -18,8 +18,6 @@ pub mod utils;
 pub use serde_json;
 pub use serde;
 pub use serde_yaml;
-pub use exception::thiserror;
-pub use exception::anyhow;
 
 #[cfg(feature = "net")]
 pub mod net;

@@ -41,7 +41,7 @@ impl TypedMessageBus {
         self.publish(msg.clone())
     }
 
-    pub fn subscribe<T>(&self) -> TypedReceiver<T>
+    pub fn sub_type_channel<T>(&self) -> TypedReceiver<T>
     where
         T: Send + Sync + 'static + Clone,
     {

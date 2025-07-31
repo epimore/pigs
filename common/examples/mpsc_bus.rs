@@ -32,9 +32,15 @@ async fn main() {
     sleep(Duration::from_secs(2)).await;
     match bus.publish(42_u8).await {
         Ok(_) => {}
-        Err(err) => { println!("[bu] receive error: {:?}", err);}
+        Err(err) => { println!("[u8] receive error: {:?}", err);}
     }
+    
+    assert_eq!(bus.publish(12i8).await.is_err(), true);
     sleep(Duration::from_secs(2)).await;
+    let mut i8_receiver = bus.sub_type_channel::<i8>().unwrap();
+    if let Ok(msg) = i8_receiver.recv_with_timeout(Duration::from_secs(1)).await {
+        println!("[i8] received: {}", msg);
+    }
     println!("Done.");
 }
 

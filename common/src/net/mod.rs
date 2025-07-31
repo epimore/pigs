@@ -3,7 +3,7 @@ use log::error;
 
 use tokio::sync::mpsc::{Receiver, Sender};
 
-use crate::exception::{GlobalResult, TransError};
+use crate::exception::{GlobalResult, GlobalResultExt};
 use crate::net::state::{Zip};
 
 mod udp;
