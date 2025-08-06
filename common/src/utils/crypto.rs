@@ -1,4 +1,5 @@
 use aes::Aes256;
+use base64::Engine;
 use block_modes::{BlockMode, Cbc};
 use block_modes::block_padding::Pkcs7;
 use log::error;
@@ -36,11 +37,11 @@ fn encrypt(key: &str, data: &str) -> GlobalResult<String> {
     let ciphertext = cipher.encrypt_vec(data.as_bytes());
     let mut buffer = bytebuffer::ByteBuffer::from_bytes(iv);
     buffer.write_bytes(&ciphertext);
-    Ok(base64::encode(buffer.to_bytes()))
+    Ok(base64::engine::general_purpose::STANDARD.encode(buffer.to_bytes()))
 }
 
 fn decrypt(key: &str, data: &str) -> GlobalResult<String> {
-    let bytes = base64::decode(data).hand_log(|err|error!("{err}"))?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(data).hand_log(|err|error!("{err}"))?;
     let cipher = AesCbc::new_from_slices(key.as_bytes(), &bytes[0..16]).hand_log(|err|error!("{err}"))?;
     let string = String::from_utf8(cipher.decrypt_vec(&bytes[16..]).hand_log(|err|error!("{err}"))?).hand_log(|err|error!("{err}"))?;
     Ok(string)
