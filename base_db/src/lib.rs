@@ -1,3 +1,3 @@
 pub mod dbx;
-pub use common::*;
+pub use base::*;
 pub use sqlx;

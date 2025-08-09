@@ -1,17 +1,17 @@
 use std::time::Duration;
 
-use common::log::{error, LevelFilter};
-use common::once_cell::sync::OnceCell;
-use common::serde::Deserialize;
+use base::log::{error, LevelFilter};
+use base::once_cell::sync::OnceCell;
+use base::serde::Deserialize;
 use sqlx::{Connection, ConnectOptions, MySql, Pool};
 use sqlx::mysql::MySqlSslMode;
 use sqlx::pool::PoolOptions;
 
-use common::cfg_lib::{conf};
-use common::exception::{GlobalError, GlobalResult};
+use base::cfg_lib::{conf};
+use base::exception::{GlobalError, GlobalResult};
 
-use common::{logger, serde_default};
-use common::utils::crypto::{default_decrypt};
+use base::{logger, serde_default};
+use base::utils::crypto::{default_decrypt};
 /*
 Rust type	MySQL/MariaDB type(s)
 bool	TINYINT(1), BOOLEAN, BOOL (see below)
@@ -52,7 +52,7 @@ pub fn get_conn_by_pool() -> GlobalResult<&'static Pool<MySql>> {
 
 #[derive(Debug, Deserialize)]
 #[conf(prefix = "db.mysql")]
-#[serde(crate = "common::serde")]
+#[serde(crate = "base::serde")]
 struct DbModel {
     host_or_ip: String,
     port: u16,
@@ -113,7 +113,7 @@ impl DbModel {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(crate = "common::serde")]
+#[serde(crate = "base::serde")]
 struct AttrsModel {
     log_global_sql_level: Option<String>,
     log_slow_sql_timeout: Option<u16>,
@@ -126,7 +126,7 @@ struct AttrsModel {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(crate = "common::serde")]
+#[serde(crate = "base::serde")]
 struct PoolModel {
     #[serde(default = "default_max_connections")]
     max_connections: u32,

@@ -1,7 +1,7 @@
 
 use std::{time::Duration};
 use tokio::time::sleep;
-use common::bus::broadcast::TypedMessageBus;
+use base::bus::broadcast::TypedMessageBus;
 
 #[tokio::main]
 async fn main() {

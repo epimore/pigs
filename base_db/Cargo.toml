@@ -1,13 +1,13 @@
 [package]
-name = "common_db"
+name = "base_db"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-common = {path = "../common"}
+base = {path = "../base"}
 sqlx = { version = "0.8", features = ["mysql","tls-rustls", "default","chrono","runtime-tokio"] }
 
 
 [features]
 default = []
-net = ["common/net"]
+net = ["base/net"]

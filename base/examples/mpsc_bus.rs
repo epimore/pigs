@@ -1,6 +1,6 @@
 use std::{time::Duration};
 use tokio::time::sleep;
-use common::bus::mpsc::TypedMessageBus;
+use base::bus::mpsc::TypedMessageBus;
 use exception::typed::common::MessageBusError;
 
 #[tokio::main]

@@ -1,15 +1,16 @@
-// use common::net;
 // use std::net::SocketAddr;
 // use std::str::FromStr;
 // use bytes::Bytes;
 // use log::error;
+// use base::net;
+// use base::net::state::Zip;
 // use exception::TransError;
-// use common::net::state::{Zip};
 //
-// //cmd: cargo run --example single_all --features net
+// //cmd: cargo run --example single_std_all --features net
 // #[tokio::main]
 // async fn main() {
-//     let (tx, mut rx) = net::init_net(net::state::Protocol::ALL, SocketAddr::from_str("0.0.0.0:18889").unwrap()).await.unwrap();
+//     let tu = net::sdx::listen(net::state::Protocol::ALL, SocketAddr::from_str("0.0.0.0:18889").unwrap()).unwrap();
+//     let (tx, mut rx) = net::sdx::run_by_tokio(tu).await.unwrap();
 //     let mut i = 0;
 //     while let Some(zip) = rx.recv().await {
 //         match zip {

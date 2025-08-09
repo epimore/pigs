@@ -54,9 +54,9 @@ fn build_register_constructor(attr: &ConAttr, struct_name: &Ident) -> proc_macro
     let reg_ins = format_ident!("register_instance_{}", camel_to_snake(struct_name.to_string().as_str()));
     match &attr.lib {
         None => quote! {
-            #[common::ctor::ctor]
+            #[base::ctor::ctor]
             fn #reg_ins() {
-               common::cfg_lib::conf::register_function(std::any::type_name::<#struct_name>(), || { #check });
+               base::cfg_lib::conf::register_function(std::any::type_name::<#struct_name>(), || { #check });
             }
     },
         Some(lib) if !lib.is_empty() => {
@@ -101,8 +101,8 @@ fn build_conf_constructor(attr: ConAttr) -> proc_macro2::TokenStream {
     match attr.lib {
         None => {
             fn_body_use_lib = quote! {
-                use common::cfg_lib;
-                use common::serde_yaml;
+                use base::cfg_lib;
+                use base::serde_yaml;
             };
         }
         Some(lib) => {
