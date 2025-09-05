@@ -9,7 +9,7 @@ edition = "2021"
 #anyhow = "1.0"
 #thiserror = "1.0"
 log = { workspace = true }
-fern = { version = "0.6", features = ["date-based"] }
+fern = { version = "0.6", features = ["date-based", "colored"] }
 chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1.36", features = ["full"] }
 dashmap = "5.5"

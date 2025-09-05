@@ -7,7 +7,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use exception::GlobalResult;
-
+//todo 优化，运行前检查是否已有进程运行：当前即使未再次运行成功也会重写meta数据
 pub trait Daemon<T> {
     fn init_privilege() -> GlobalResult<(Self, T)>
     where

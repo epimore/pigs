@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use chrono::Local;
+use fern::colors::{Color, ColoredLevelConfig};
 use fern::Dispatch;
 use log::{error, LevelFilter};
 use serde::{Deserialize, Deserializer};
@@ -61,13 +62,19 @@ impl Logger {
         let default_level: LevelFilter = level_filter(&log.level);
         let path = std::path::Path::new(&log.store_path);
         std::fs::create_dir_all(path).hand_log(|msg| error!("create log dir failed: {msg}"))?;
+        let colors = ColoredLevelConfig::new()
+            // .trace(Color::White)
+            // .info(Color::Green)
+            .debug(Color::Blue)
+            .error(Color::Red)
+            .warn(Color::Yellow);
         let mut add_crate = Vec::new();
         let mut dispatch = Dispatch::new()
             .format(move |out, message, record| {
                 out.finish(format_args!(
                     "[{}] [{}] [{}] {} {}\n{}",
                     Local::now().format("%Y-%m-%d %H:%M:%S"),
-                    record.level(),
+                    colors.color(record.level()),
                     record.target(),
                     record.file().unwrap_or("unknown"),
                     record.line().unwrap_or(0),
