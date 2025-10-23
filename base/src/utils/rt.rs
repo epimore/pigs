@@ -8,6 +8,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::{Handle, Runtime};
+use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
 ///协议类型	      推荐线程数	运行时类型	理由
@@ -137,13 +138,19 @@ impl GlobalRuntime {
         })
     }
 
-    pub async fn order_shutdown(order: &[RuntimeType]) {
-        Signal::exit().await;
-        for rt_type in order {
-            GLOBAL_RUNTIMES.remove(rt_type).map(|(_, (rt, cancel))| {
+    pub async fn order_shutdown(orders: &[RuntimeType]) {
+        Signal::wait_exit_signal().await;
+        orders.iter().for_each(|rt_type| {
+            GLOBAL_RUNTIMES.get(rt_type).map(|r| {
+                let (_, cancel) = r.value();
                 cancel.cancel();
-                rt.shutdown_timeout(Duration::from_secs(2));
             });
-        }
+        });
+        sleep(Duration::from_secs(1)).await;
+        orders.iter().for_each(|rt_type| {
+            GLOBAL_RUNTIMES.remove(rt_type).map(|(_, (rt, _))| {
+                tokio::task::spawn_blocking(|| rt.shutdown_timeout(Duration::from_secs(2)))
+            });
+        });
     }
 }

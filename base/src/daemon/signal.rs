@@ -13,7 +13,7 @@ impl Signal {
     }
 
     /// 此函数在程序生命周期只调用一次
-    pub async fn exit() {
+    pub async fn wait_exit_signal() {
         // 监听 Ctrl+C
         let ctrl_c = async {
             signal::ctrl_c()
