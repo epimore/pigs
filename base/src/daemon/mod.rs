@@ -1,5 +1,6 @@
 #[cfg(unix)]
 mod unix;
+pub mod signal;
 
 use std::{env, fs};
 use std::fs::OpenOptions;

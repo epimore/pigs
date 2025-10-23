@@ -35,6 +35,7 @@ base64 = "0.22"
 ctor = "0.2"
 hex = "0.4"
 sha2 = "0.10"
+tokio-util = "0.7"
 
 # Unix-like 系统（Linux + macOS）
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
