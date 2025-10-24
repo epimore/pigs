@@ -2,7 +2,7 @@ use crate::daemon::signal::Signal;
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use exception::{GlobalError, GlobalResult};
-use log::{error};
+use log::error;
 use once_cell::sync::Lazy;
 use std::fmt::Debug;
 use std::time::Duration;
@@ -20,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RuntimeType {
+    Main, // 默认初始化主运行时
     // 网络I/O密集型 4
     CommonNetwork, // 通用网络
     HttpApi,       // HTTP API 服务
@@ -45,6 +46,7 @@ pub enum RuntimeType {
 impl RuntimeType {
     pub fn as_thread_name(&self) -> String {
         match self {
+            RuntimeType::Main => "main".to_string(),
             RuntimeType::CommonNetwork => "common-network".to_string(),
             RuntimeType::HttpApi => "http-api".to_string(),
             RuntimeType::WebSocket => "websocket".to_string(),
@@ -87,7 +89,12 @@ macro_rules! create_default_runtime {
 }
 
 static GLOBAL_RUNTIMES: Lazy<DashMap<RuntimeType, (Runtime, CancellationToken)>> =
-    Lazy::new(|| DashMap::new());
+    Lazy::new(|| {
+        let map = DashMap::new();
+        let rt = create_default_runtime!(RuntimeType::Main);
+        map.insert(RuntimeType::Main, (rt, CancellationToken::new()));
+        map
+    });
 
 pub struct GlobalRuntime {
     pub rt_handle: Handle,
@@ -127,6 +134,10 @@ impl GlobalRuntime {
         }
     }
 
+    pub fn get_main_runtime() -> Self {
+        Self::get_runtime(&RuntimeType::Main).unwrap()
+    }
+
     pub fn get_runtime(rt_type: &RuntimeType) -> Option<Self> {
         GLOBAL_RUNTIMES.get(rt_type).map(|r| {
             let (rt, cancel) = r.value();
@@ -137,19 +148,29 @@ impl GlobalRuntime {
         })
     }
 
-    pub async fn order_shutdown(orders: &[RuntimeType]) {
+    pub fn order_shutdown<F: FnOnce(&str)>(orders: &[RuntimeType], f: F) {
+        let rt = Self::get_main_runtime();
+        let runtime = rt.rt_handle.block_on(Self::shutdown(orders));
+        runtime.shutdown_timeout(Duration::from_secs(2));
+        f(r#"
+          ┌─────────────────────────────────────┐
+          │ Application Shutdown · 🟡 Bye...     │
+          └─────────────────────────────────────┘"#);
+    }
+
+    async fn shutdown(orders: &[RuntimeType]) -> Runtime {
         Signal::wait_exit_signal().await;
         orders.iter().for_each(|rt_type| {
-            GLOBAL_RUNTIMES.get(rt_type).map(|r| {
-                let (_, cancel) = r.value();
-                cancel.cancel();
-            });
+            Self::get_runtime(rt_type).map(|Self { cancel, .. }| cancel.cancel());
         });
+        let (_, (main_rt, cancel)) = GLOBAL_RUNTIMES.remove(&RuntimeType::Main).unwrap();
+        cancel.cancel();
         sleep(Duration::from_secs(1)).await;
         orders.iter().for_each(|rt_type| {
             GLOBAL_RUNTIMES.remove(rt_type).map(|(_, (rt, _))| {
                 tokio::task::spawn_blocking(|| rt.shutdown_timeout(Duration::from_secs(2)))
             });
         });
+        main_rt
     }
 }
