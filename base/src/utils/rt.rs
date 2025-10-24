@@ -2,10 +2,9 @@ use crate::daemon::signal::Signal;
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use exception::{GlobalError, GlobalResult};
-use log::error;
+use log::{error};
 use once_cell::sync::Lazy;
 use std::fmt::Debug;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::{Handle, Runtime};
 use tokio::time::sleep;
@@ -87,12 +86,12 @@ macro_rules! create_default_runtime {
     }};
 }
 
-static GLOBAL_RUNTIMES: Lazy<DashMap<RuntimeType, (Runtime, Arc<CancellationToken>)>> =
+static GLOBAL_RUNTIMES: Lazy<DashMap<RuntimeType, (Runtime, CancellationToken)>> =
     Lazy::new(|| DashMap::new());
 
 pub struct GlobalRuntime {
     pub rt_handle: Handle,
-    pub cancel: Arc<CancellationToken>,
+    pub cancel: CancellationToken,
 }
 
 impl GlobalRuntime {
@@ -102,26 +101,26 @@ impl GlobalRuntime {
                 error!("{:?} {}", rt_type, msg)
             })),
             Entry::Vacant(vac) => {
-                let cancel = Arc::new(CancellationToken::new());
+                let cancel = CancellationToken::new();
                 let grt = Self {
                     rt_handle: rt.handle().clone(),
                     cancel: cancel.clone(),
                 };
-                vac.insert((rt, cancel));
+                vac.insert((rt, cancel.clone()));
                 Ok(grt)
             }
         }
     }
 
-    pub fn register_default(rt_type: RuntimeType, threads: Option<usize>) -> GlobalResult<Self> {
-        let rt = match threads {
-            None => {
-                create_default_runtime!(rt_type)
-            }
-            Some(num) => {
-                create_default_runtime!(rt_type, num)
-            }
-        };
+    pub fn register_default(rt_type: RuntimeType) -> GlobalResult<Self> {
+        let rt = create_default_runtime!(rt_type);
+        match Self::register(rt_type, rt) {
+            Ok(grt) => Ok(grt),
+            Err(err) => Err(err),
+        }
+    }
+    pub fn register_threads_default(rt_type: RuntimeType, threads: usize) -> GlobalResult<Self> {
+        let rt = create_default_runtime!(rt_type, threads);
         match Self::register(rt_type, rt) {
             Ok(grt) => Ok(grt),
             Err(err) => Err(err),

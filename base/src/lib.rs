@@ -6,6 +6,7 @@ pub use log;
 pub use once_cell;
 pub use rand;
 pub use tokio;
+pub use tokio_util;
 pub use cfg_lib;
 pub use exception;
 pub use ctor;
