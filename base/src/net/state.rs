@@ -1,17 +1,14 @@
-use std::net::SocketAddr;
-use std::sync::Arc;
 use bytes::Bytes;
+use constructor::{Get, New, Set};
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
+use std::net::SocketAddr;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::mpsc::{Sender, Receiver};
-use constructor::{Get, New, Set};
-
+use tokio::sync::mpsc::{Receiver, Sender};
 
 //TCP连接有状态，需要持有每个连接的句柄
-pub static TCP_HANDLE_MAP: Lazy<Arc<DashMap<Association, Sender<Zip>>>> = Lazy::new(|| {
-    Arc::new(DashMap::new())
-});
+pub static TCP_HANDLE_MAP: Lazy<DashMap<Association, Sender<Zip>>> =
+    Lazy::new(|| DashMap::new());
 pub const SOCKET_BUFFER_SIZE: usize = 4096;
 pub const CHANNEL_BUFFER_SIZE: usize = 10000;
 pub const UDP: &str = "UDP";
@@ -25,6 +22,20 @@ pub struct Event {
     pub type_code: u8,
 }
 
+impl Event {
+    fn build_shutdown_event(association: Option<Association>) -> Self {
+        let association = association.unwrap_or_else(|| Association {
+            local_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            remote_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            protocol: Protocol::ALL,
+        });
+        Self {
+            association,
+            type_code: 0,
+        }
+    }
+}
+
 #[derive(Debug, Eq, Hash, PartialEq, Clone, Copy)]
 pub enum Protocol {
     UDP,
@@ -35,9 +46,9 @@ pub enum Protocol {
 impl Protocol {
     pub fn get_value(&self) -> &str {
         match self {
-            Protocol::UDP => { UDP }
-            Protocol::TCP => { TCP }
-            Protocol::ALL => { ALL }
+            Protocol::UDP => UDP,
+            Protocol::TCP => TCP,
+            Protocol::ALL => ALL,
         }
     }
 }
@@ -60,6 +71,16 @@ pub enum Zip {
 }
 
 impl Zip {
+    pub fn build_shutdown_zip(association: Option<Association>) -> Self {
+        Self::Event(Event::build_shutdown_event(association))
+    }
+
+    pub fn is_shutdown_event(&self) -> bool {
+        if let Self::Event(Event { type_code: 0, .. }) = self {
+            return true;
+        }
+        false
+    }
     pub fn build_data(package: Package) -> Self {
         Self::Data(package)
     }
@@ -70,15 +91,21 @@ impl Zip {
 
     pub fn get_association(&self) -> Association {
         match &self {
-            Zip::Data(Package { association, .. }) => { association.clone() }
-            Zip::Event(Event { association, .. }) => { association.clone() }
+            Zip::Data(Package { association, .. }) => association.clone(),
+            Zip::Event(Event { association, .. }) => association.clone(),
         }
     }
 
     pub fn get_association_protocol(&self) -> &Protocol {
         match self {
-            Zip::Data(Package { association: Association { protocol, .. }, .. }) => { protocol }
-            Zip::Event(Event { association: Association { protocol, .. }, .. }) => { protocol }
+            Zip::Data(Package {
+                association: Association { protocol, .. },
+                ..
+            }) => protocol,
+            Zip::Event(Event {
+                association: Association { protocol, .. },
+                ..
+            }) => protocol,
         }
     }
 }

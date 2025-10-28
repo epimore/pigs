@@ -44,7 +44,10 @@ pub async fn read(local_addr: SocketAddr, udp_socket: &UdpSocket, tx: Sender<Zip
                             );
                     let association = Association::new(local_addr, remote_addr, Protocol::UDP);
                     let zip = Zip::build_data(Package::new(association, Bytes::copy_from_slice(&buf[..len])));
-                    let _ = tx.send(zip).await.hand_log(|msg| error!("{msg}"));
+                    //接收端drop后，跳出循环
+                    if let Err(_) = tx.send(zip).await {
+                       break;
+                    }
                 }
             }
 
@@ -63,6 +66,7 @@ pub async fn read(local_addr: SocketAddr, udp_socket: &UdpSocket, tx: Sender<Zip
 }
 
 pub async fn write(udp_socket: &UdpSocket, mut rx: Receiver<Zip>) {
+    //发送端drop后，跳出循环
     while let Some(zip) = rx.recv().await {
         let _ = udp_socket.writable().await;
         match zip {

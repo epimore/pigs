@@ -1,14 +1,16 @@
 use std::net::SocketAddr;
 use std::sync::{Arc};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::{io};
 use crate::net::state::{Zip, Gate, GateListener, GateAccept, Protocol, CHANNEL_BUFFER_SIZE, TCP_HANDLE_MAP};
 use crate::net::{tcp, udp};
-use log::{error, warn};
+use log::{error};
 use crate::exception::{GlobalResult, GlobalResultExt};
 use tokio::sync::{mpsc, oneshot};
 use tokio::sync::mpsc::{Receiver, Sender};
 use exception::GlobalError;
 
+static IS_RUNNING: AtomicBool = AtomicBool::new(true);
 //启动监听并返回读写句柄
 pub async fn listen(protocol: Protocol, local_addr: SocketAddr, tx: oneshot::Sender<GateListener>) -> GlobalResult<(Sender<Zip>, Receiver<Zip>)> {
     //socket 读数据通道 input
@@ -47,7 +49,13 @@ pub fn classify(mut output: Receiver<Zip>, tw_tx: Sender<Zip>, uw_tx: Sender<Zip
             match zip.get_association_protocol() {
                 &Protocol::UDP => { let _ = uw_tx.clone().send(zip).await.hand_log(|msg| error!("{msg}")); }
                 &Protocol::TCP => { let _ = tw_tx.clone().send(zip).await.hand_log(|msg| error!("{msg}")); }
-                &Protocol::ALL => { warn!("全协议发送????") }
+                &Protocol::ALL => {
+                    //shutdown
+                    if zip.is_shutdown_event() {
+                        let _ = tw_tx.clone().send(zip).await.hand_log(|msg| error!("{msg}"));
+                        IS_RUNNING.store(false, Ordering::SeqCst);
+                    }
+                }
             }
         }
     });
@@ -63,7 +71,7 @@ pub async fn accept(rx: oneshot::Receiver<GateListener>, tx: Sender<GateAccept>)
                     let local_addr = gate.get_local_addr().clone();
                     let input = gate.get_input().clone();
                     tokio::spawn(async move {
-                        loop {
+                        while IS_RUNNING.load(Ordering::SeqCst) {
                             //给予每个对外发送数据tcp连接一个接收句柄，并将其对应的发送句柄保存起来
                             let (lone_output_tx, lone_output_rx) = mpsc::channel(CHANNEL_BUFFER_SIZE);
                             let gate1 = Gate::new(local_addr, input.clone(), lone_output_rx);
@@ -74,15 +82,9 @@ pub async fn accept(rx: oneshot::Receiver<GateListener>, tx: Sender<GateAccept>)
                         //接收对外输出信息，并根据Zip上的账单信息，发送到对应的TCP发送通道
                         let mut receiver = gate.get_owned_output();
                         while let Some(zip) = receiver.recv().await {
-                            let association = zip.get_association();
-                            match TCP_HANDLE_MAP.clone().get(&association) {
-                                None => {
-                                    warn!("【TCP】连接不存在 => {:?}",&association);
-                                }
-                                Some(lone_output_tx) => {
-                                    let _ = lone_output_tx.send(zip).await.hand_log(|msg| error!("{msg}"));
-                                }
-                            }
+                            TCP_HANDLE_MAP.get(&zip.get_association()).map(async |lone_output_tx| {
+                                let _ = lone_output_tx.send(zip).await.hand_log(|msg| error!("{msg}"));
+                            });
                         }
                     });
                 }
@@ -94,7 +96,7 @@ pub async fn accept(rx: oneshot::Receiver<GateListener>, tx: Sender<GateAccept>)
                     let local_addr = tcp_gate.get_local_addr().clone();
                     let input = tcp_gate.get_input().clone();
                     tokio::spawn(async move {
-                        loop {
+                        while IS_RUNNING.load(Ordering::SeqCst) {
                             //给予每个对外发送数据tcp连接一个接收句柄，并将其对应的发送句柄保存起来
                             let (lone_output_tx, lone_output_rx) = mpsc::channel(CHANNEL_BUFFER_SIZE);
                             let gate1 = Gate::new(local_addr, input.clone(), lone_output_rx);
@@ -105,15 +107,9 @@ pub async fn accept(rx: oneshot::Receiver<GateListener>, tx: Sender<GateAccept>)
                         //接收对外输出信息，并根据Zip上的账单信息，发送到对应的TCP发送通道
                         let mut receiver = tcp_gate.get_owned_output();
                         while let Some(zip) = receiver.recv().await {
-                            let association = zip.get_association();
-                            match TCP_HANDLE_MAP.clone().get(&association) {
-                                None => {
-                                    warn!("【TCP】连接不存在 => {:?}",&association);
-                                }
-                                Some(lone_output_tx) => {
-                                    let _ = lone_output_tx.send(zip).await.hand_log(|msg| error!("{msg}"));
-                                }
-                            }
+                            TCP_HANDLE_MAP.get(&zip.get_association()).map(async |lone_output_tx| {
+                                let _ = lone_output_tx.send(zip).await.hand_log(|msg| error!("{msg}"));
+                            });
                         }
                     });
                     udp::accept(udp_gate, udp_socket, tx).await?;
@@ -148,6 +144,7 @@ pub async fn rw(mut rx: Receiver<GateAccept>) {
                 let receiver = gate.get_owned_output();
                 let aus = Arc::new(udp_socket);
                 let ausc = aus.clone();
+                //子任务读写循环跳出后，udp_socket生命周期自动drop，完成udp关闭释放
                 tokio::spawn(async move {
                     let _ = udp::read(local_addr, &*aus, sender).await;
                 });

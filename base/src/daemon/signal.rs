@@ -1,14 +1,13 @@
 use log::debug;
 use once_cell::sync::{Lazy};
-use std::sync::Arc;
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
 /// 全局退出信号，如有需要可将此信号在各处持有【包括发送给分布式其他系统以表示该程序退出】
-static SHUTDOWN: Lazy<Arc<CancellationToken>> = Lazy::new(|| Arc::new(CancellationToken::new()));
+static SHUTDOWN: Lazy<CancellationToken> = Lazy::new(|| CancellationToken::new());
 
 pub struct Signal;
 impl Signal {
-    pub fn get_cancel() -> Arc<CancellationToken> {
+    pub fn get_cancel() -> CancellationToken {
         SHUTDOWN.clone()
     }
 
