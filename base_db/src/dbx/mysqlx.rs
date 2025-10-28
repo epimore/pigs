@@ -1,14 +1,13 @@
+use std::sync::LazyLock;
 use std::time::Duration;
 
-use base::log::{error, LevelFilter};
-use base::once_cell::sync::OnceCell;
+use base::log::{LevelFilter};
 use base::serde::Deserialize;
 use sqlx::{Connection, ConnectOptions, MySql, Pool};
 use sqlx::mysql::MySqlSslMode;
 use sqlx::pool::PoolOptions;
 
 use base::cfg_lib::{conf};
-use base::exception::{GlobalError, GlobalResult};
 
 use base::{logger, serde_default};
 use base::utils::crypto::{default_decrypt};
@@ -33,21 +32,10 @@ Ipv6Addr	INET6 (MariaDB-only), VARCHAR, TEXT
 MySqlTime	TIME (encode and decode full range)
 Duration	TIME (for decoding positive values only)
 */
-static MYSQL_POOL: OnceCell<Pool<MySql>> = OnceCell::new();
+static MYSQL_POOL: LazyLock<Pool<MySql>> = LazyLock::new(||DbModel::build_pool_conn());
 
-
-pub fn init_conn_pool() -> GlobalResult<()> {
-    let pool_conn = DbModel::build_pool_conn();
-    MYSQL_POOL.set(pool_conn)
-        .map_err(|_|
-        GlobalError::new_sys_error("Initializing mysql connection pool failed due to multiple settings:{msg}",
-                                   |msg| error!("{msg}")))?;
-    Ok(())
-}
-
-pub fn get_conn_by_pool() -> GlobalResult<&'static Pool<MySql>> {
-    let conn_pool = MYSQL_POOL.get().ok_or_else(|| GlobalError::new_sys_error("the mysql connection pool has not been initialized", |msg| error!("{msg}")))?;
-    Ok(conn_pool)
+pub fn get_conn_by_pool() -> &'static Pool<MySql> {
+    &*MYSQL_POOL
 }
 
 #[derive(Debug, Deserialize)]
