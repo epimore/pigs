@@ -97,6 +97,11 @@ where
     println!("restart ...");
     if stop_service() {
         thread::sleep(Duration::from_secs(1));
+        println!("∟......");
+        thread::sleep(Duration::from_secs(1));
+        println!("  ∟......");
+        thread::sleep(Duration::from_secs(1));
+        println!("    ∟......");
         start_service::<D, T>();
     }
 }

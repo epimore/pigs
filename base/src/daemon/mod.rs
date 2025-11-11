@@ -1,15 +1,18 @@
+pub mod signal;
 #[cfg(unix)]
 mod unix;
-pub mod signal;
 
-use std::{env, fs};
+use exception::GlobalResult;
+use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
-use serde::{Deserialize, Serialize};
-use exception::GlobalResult;
+use std::{env, fs};
+use cfg_lib::CliBasic;
+
 //todo 优化，运行前检查是否已有进程运行：当前即使未再次运行成功也会重写meta数据
 pub trait Daemon<T> {
+    fn cli_basic() -> CliBasic;
     fn init_privilege() -> GlobalResult<(Self, T)>
     where
         Self: Sized;
@@ -36,12 +39,15 @@ impl DaemonMeta {
             .truncate(true)
             .open(meta_path)
             .expect("Failed to open meta file");
-        file.write_all(content.as_bytes()).expect("Failed to write meta");
+        file.write_all(content.as_bytes())
+            .expect("Failed to write meta");
     }
 
     fn load_meta() -> Self {
         let meta_path = Self::get_meta_file_path();
-        let content = fs::read_to_string(meta_path).ok().expect("Failed to read meta file");
+        let content = fs::read_to_string(meta_path)
+            .ok()
+            .expect("Failed to read meta file");
         serde_json::from_str(&content).expect("Failed to deserialize meta")
     }
 }
@@ -50,10 +56,15 @@ pub fn run<D, T>()
 where
     D: Daemon<T>,
 {
-    let arg_matches = cfg_lib::conf::get_arg_match();
+    let app_info = D::cli_basic();
+    let arg_matches = cfg_lib::conf::get_arg_cmd(app_info);
     match arg_matches.subcommand() {
         Some(("start", args)) => {
-            let config_path = args.try_get_one::<String>("config").expect("get config failed").expect("not found config").to_string();
+            let config_path = args
+                .try_get_one::<String>("config")
+                .expect("get config failed")
+                .expect("not found config")
+                .to_string();
             cfg_lib::conf::init_cfg(config_path.clone());
             let daemon = args.get_flag("daemon");
             let meta = DaemonMeta {
