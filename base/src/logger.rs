@@ -73,7 +73,7 @@ impl Logger {
             .format(move |out, message, record| {
                 out.finish(format_args!(
                     "[{}] [{}] [{}] {} {} >> {}",
-                    Local::now().format("%Y-%m-%d %H:%M:%S.3f"),
+                    Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
                     colors.color(record.level()),
                     record.target(),
                     record.file().unwrap_or("unknown"),
