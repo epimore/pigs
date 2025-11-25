@@ -63,8 +63,8 @@ impl Logger {
         let path = std::path::Path::new(&log.store_path);
         std::fs::create_dir_all(path).hand_log(|msg| error!("create log dir failed: {msg}"))?;
         let colors = ColoredLevelConfig::new()
-            // .trace(Color::White)
-            // .info(Color::Green)
+            .trace(Color::White)
+            .info(Color::Green)
             .debug(Color::Blue)
             .error(Color::Red)
             .warn(Color::Yellow);
@@ -72,8 +72,8 @@ impl Logger {
         let mut dispatch = Dispatch::new()
             .format(move |out, message, record| {
                 out.finish(format_args!(
-                    "[{}] [{}] [{}] {} {}\n{}",
-                    Local::now().format("%Y-%m-%d %H:%M:%S"),
+                    "[{}] [{}] [{}] {} {} >> {}",
+                    Local::now().format("%Y-%m-%d %H:%M:%S.3f"),
                     colors.color(record.level()),
                     record.target(),
                     record.file().unwrap_or("unknown"),
