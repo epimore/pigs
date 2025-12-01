@@ -82,9 +82,9 @@ pub async fn accept(rx: oneshot::Receiver<GateListener>, tx: Sender<GateAccept>)
                         //接收对外输出信息，并根据Zip上的账单信息，发送到对应的TCP发送通道
                         let mut receiver = gate.get_owned_output();
                         while let Some(zip) = receiver.recv().await {
-                            TCP_HANDLE_MAP.get(&zip.get_association()).map(async |lone_output_tx| {
+                            if let Some(lone_output_tx) = TCP_HANDLE_MAP.get(&zip.get_association()) {
                                 let _ = lone_output_tx.send(zip).await.hand_log(|msg| error!("{msg}"));
-                            });
+                            }
                         }
                     });
                 }
@@ -107,9 +107,9 @@ pub async fn accept(rx: oneshot::Receiver<GateListener>, tx: Sender<GateAccept>)
                         //接收对外输出信息，并根据Zip上的账单信息，发送到对应的TCP发送通道
                         let mut receiver = tcp_gate.get_owned_output();
                         while let Some(zip) = receiver.recv().await {
-                            TCP_HANDLE_MAP.get(&zip.get_association()).map(async |lone_output_tx| {
+                            if let Some(lone_output_tx) = TCP_HANDLE_MAP.get(&zip.get_association()) {
                                 let _ = lone_output_tx.send(zip).await.hand_log(|msg| error!("{msg}"));
-                            });
+                            }
                         }
                     });
                     udp::accept(udp_gate, udp_socket, tx).await?;
