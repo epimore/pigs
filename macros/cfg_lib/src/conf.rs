@@ -95,5 +95,6 @@ pub fn get_arg_cmd(app_info: CliBasic) -> ArgMatches {
         )
         .subcommand(Command::new("stop").about("Stop the service"))
         .subcommand(Command::new("restart").about("Restart the service"))
+        .subcommand(Command::new("status").about("status the service"))
         .get_matches()
 }

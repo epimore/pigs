@@ -132,6 +132,16 @@ where
                 eprintln!("Not running daemon mode");
             }
         }
+        Some(("status",_)) =>{
+            if cfg!(target_os = "linux") || cfg!(target_os = "macos") {
+                #[cfg(unix)]
+                {
+                    unix::status_service();
+                }
+            } else {
+                eprintln!("The status only supports macOS, and Linux");
+            }
+        }
         _other => {
             eprintln!("Please add subcommands to operate: [start|stop|restart]")
         }
