@@ -53,7 +53,7 @@ pub(super) fn status_service() {
     match read_pid() {
         Some(pid) => {
             if is_process_running(pid) {
-                println!("Service is running with PID {}", pid);
+                println!("Service is running with PID: {}", pid);
 
                 // === 获取并格式化启动时间为 YYYY-MM-DD HH:MM:SS ===
                 let mut printed_start_time = false;
@@ -87,18 +87,18 @@ pub(super) fn status_service() {
                     }
                 }
 
-                // === 原有 Process info 表格（完全不变）===
+                // === Process info 表格===
                 if let Ok(output) = Command::new("ps")
                     .arg("-p")
                     .arg(pid.to_string())
                     .arg("-o")
-                    .arg("pid,user,%cpu,%mem,cmd")
+                    .arg("user,%cpu,%mem,cmd")
                     .output()
                 {
                     let info = String::from_utf8_lossy(&output.stdout);
                     let trimmed = info.trim();
                     if !trimmed.is_empty() {
-                        // 移除首行 "PID ..." 中的 "PID" 前缀（保持你原有的逻辑）
+                        // 移除首行 "PID ..." 中的 "PID" 前缀
                         println!("Process info:\n{}", trimmed.trim_start_matches("PID"));
                     }
                 }
