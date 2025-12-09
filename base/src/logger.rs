@@ -2,7 +2,6 @@ use std::path::PathBuf;
 
 use chrono::Local;
 use fern::colors::{Color, ColoredLevelConfig};
-use fern::Dispatch;
 use log::{error, LevelFilter};
 use serde::{Deserialize, Deserializer};
 
@@ -18,17 +17,15 @@ use crate::serde_default;
 ///   level: warn #全局日志等级 可选：默认 info
 ///   prefix: server #全局日志文件前缀; 可选：默认 app 指定生成日志文件添加日期后缀，如 server_2024-10-26.log
 ///   store_path: ./logs #日志文件根目录；可选 默认 当前目录
-///   specify: #指定日志输出 可选，不指定日志
+///   specify: #指定日志输出 可选，不指定则默认输出到全局日志里
 ///     - crate_name: test_log::a,test_log::d$  #或者test_log用指全部  必选 以$结束为全路径匹配，精准记录指定日志
 ///       level: debug #日志等级 必选
 ///       file_name_prefix: a #日志文件前缀 可选 当未指定时，记录到全局日志文件中，等级由指定日志等级控制
-///       additivity: false #是否记录到全局日志文件中 可选 默认false,全局日志文件会再次根据全局日志等级过滤记录
 ///     - crate_name: test_log::b  #或者test_log用指全部
 ///       level: debug #日志等级
 ///     - crate_name: test_log::c  #或者test_log用指全部
 ///       level: debug #日志等级
 ///       file_name_prefix: c #日志文件前缀
-///       additivity: true #是否记录到全局日志文件中
 ///  ```
 #[derive(Debug, Deserialize)]
 #[conf(prefix = "log", lib)]
@@ -51,86 +48,124 @@ pub struct Specify {
     #[serde(deserialize_with = "validate_level")]
     level: String,
     file_name_prefix: Option<String>,
-    additivity: Option<bool>,
 }
 
 
 impl Logger {
     pub fn init() -> GlobalResult<()> {
         let mut log: Logger = Logger::conf();
-        if !log.store_path.ends_with("/") { log.store_path.push("") };
-        let default_level: LevelFilter = level_filter(&log.level);
-        let path = std::path::Path::new(&log.store_path);
-        std::fs::create_dir_all(path).hand_log(|msg| error!("create log dir failed: {msg}"))?;
+
+        // store_path 逻辑
+        let store_path = if log.store_path.as_os_str().is_empty() {
+            PathBuf::from("./")
+        } else {
+            (log.store_path).push("");
+            log.store_path
+        };
+
+        std::fs::create_dir_all(&store_path)
+            .hand_log(|msg| error!("create log dir failed: {msg}"))?;
+
+        // 基础 formatter
         let colors = ColoredLevelConfig::new()
             .trace(Color::White)
             .info(Color::Green)
             .debug(Color::Blue)
-            .error(Color::Red)
-            .warn(Color::Yellow);
-        let mut add_crate = Vec::new();
-        let mut dispatch = Dispatch::new()
-            .format(move |out, message, record| {
-                out.finish(format_args!(
-                    "[{}] [{}] [{}] {} {} >> {}",
-                    Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
-                    colors.color(record.level()),
-                    record.target(),
-                    record.file().unwrap_or("unknown"),
-                    record.line().unwrap_or(0),
-                    message,
-                ))
-            });
+            .warn(Color::Yellow)
+            .error(Color::Red);
+
+        let formatter = move |out: fern::FormatCallback,
+                              msg: &std::fmt::Arguments,
+                              record: &log::Record| {
+            out.finish(format_args!(
+                "[{}] [{}] [{}] {}:{} >> {}",
+                Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
+                colors.color(record.level()),
+                record.target(),
+                record.file().unwrap_or("unknown"),
+                record.line().unwrap_or(0),
+                msg,
+            ))
+        };
+
+        // 记录所有独立输出的 target，用于主日志排除
+        let mut exclude_targets: Vec<String> = Vec::new();
+
+        // 主日志（最后再 chain）
+        let main_logger = fern::Dispatch::new()
+            .format(formatter.clone())
+            .level(level_filter(&log.level))   // 默认等级
+            .chain(std::io::stdout())
+            .chain(fern::DateBased::new(
+                &store_path,
+                format!("{}_{}.log", log.prefix, "%Y-%m-%d"),
+            ));
+
+        // 最终总 dispatch
+        let mut dispatch = fern::Dispatch::new();
+
+        // 处理 specify
         if let Some(specify) = &log.specify {
             for s in specify {
-                let module_level = level_filter(&s.level);
-                let targets: Vec<String> = s.crate_name.split(",").map(|str| str.trim().to_string()).collect();
-                // 根据 `additivity` 决定是否记录到默认日志
-                if !s.additivity.unwrap_or(false) {
-                    add_crate.extend(targets.clone());
+                let targets: Vec<String> = s
+                    .crate_name
+                    .split(',')
+                    .map(|t| t.trim().to_string())
+                    .collect();
+
+                let level = level_filter(&s.level);
+
+                // case ①：独立文件输出
+                if let Some(file_prefix) = &s.file_name_prefix {
+                    exclude_targets.extend(targets.clone());
+
+                    let file_logger = fern::Dispatch::new()
+                        .format(formatter.clone())
+                        .level(level)
+                        .filter(move |meta| match_target(meta.target(), &targets))
+                        .chain(fern::DateBased::new(
+                            &store_path,
+                            format!("{}_{}.log", file_prefix, "%Y-%m-%d"),
+                        ));
+
+                    dispatch = dispatch.chain(file_logger);
+
+                } else {
+                    // case ②：使用主日志，提高等级
+                    for t in targets {
+                        dispatch = dispatch.level_for(t, level);
+                    }
                 }
-
-                // 为特定模块创建日志输出
-                let mut module_dispatch = Dispatch::new()
-                    .level(module_level)
-                    .filter(move |metadata| targets.iter().any(|t| {
-                        if t.ends_with("$") {
-                            metadata.target() == &t[..t.len() - 1]
-                        } else {
-                            metadata.target().starts_with(t)
-                        }
-                    }));
-
-                // 如果指定了文件名前缀，则将日志输出到指定的文件
-                let prefix = s.file_name_prefix.as_deref().unwrap_or(&log.prefix);
-                module_dispatch = module_dispatch
-                    .chain(std::io::stdout())
-                    .chain(fern::DateBased::new(&log.store_path, format!("{}_{}.log", prefix, "%Y-%m-%d".to_string())));
-
-                dispatch = dispatch.chain(module_dispatch);
             }
         }
 
-        // 配置默认日志输出
-        let default_dispatch = Dispatch::new()
-            .level(default_level)
-            .filter(move |metadata| !add_crate.iter().any(|t| {
-                if t.ends_with("$") {
-                    metadata.target() == &t[..t.len() - 1]
-                } else {
-                    metadata.target().starts_with(t)
-                }
-            }))
-            .chain(std::io::stdout())
-            .chain(fern::DateBased::new(&log.store_path, format!("{}_{}.log", log.prefix, "%Y-%m-%d".to_string())));
+        // 主日志排除“独立文件输出”的 targets
+        let main_logger = main_logger.filter(move |meta| {
+            !match_target(meta.target(), &exclude_targets)
+        });
 
+        dispatch = dispatch.chain(main_logger);
+
+        // ⑧ 正式生效
         dispatch
-            .chain(default_dispatch)
             .apply()
-            .hand_log(|msg| error!("Logger initialization failed: {msg}"))?;
+            .hand_log(|msg| error!("Logger init failed: {msg}"))?;
+
         Ok(())
     }
 }
+
+// target 匹配逻辑
+fn match_target(target: &str, rules: &[String]) -> bool {
+    rules.iter().any(|r| {
+        if r.ends_with('$') {
+            target == &r[..r.len() - 1]
+        } else {
+            target.starts_with(r)
+        }
+    })
+}
+
 
 pub fn level_filter(level: &str) -> LevelFilter {
     match level.trim().to_uppercase().as_str() {
