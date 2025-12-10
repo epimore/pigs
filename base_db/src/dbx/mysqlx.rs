@@ -11,27 +11,6 @@ use base::cfg_lib::{conf};
 
 use base::{logger, serde_default};
 use base::utils::crypto::{default_decrypt};
-/*
-Rust type	MySQL/MariaDB type(s)
-bool	TINYINT(1), BOOLEAN, BOOL (see below)
-i8	TINYINT
-i16	SMALLINT
-i32	INT
-i64	BIGINT
-u8	TINYINT UNSIGNED
-u16	SMALLINT UNSIGNED
-u32	INT UNSIGNED
-u64	BIGINT UNSIGNED
-f32	FLOAT
-f64	DOUBLE
-&str, String	VARCHAR, CHAR, TEXT
-&[u8], Vec<u8>	VARBINARY, BINARY, BLOB
-IpAddr	VARCHAR, TEXT
-Ipv4Addr	INET4 (MariaDB-only), VARCHAR, TEXT
-Ipv6Addr	INET6 (MariaDB-only), VARCHAR, TEXT
-MySqlTime	TIME (encode and decode full range)
-Duration	TIME (for decoding positive values only)
-*/
 static MYSQL_POOL: LazyLock<Pool<MySql>> = LazyLock::new(||DbModel::build_pool_conn());
 
 pub fn get_conn_by_pool() -> &'static Pool<MySql> {
@@ -147,12 +126,12 @@ serde_default!(default_connection_timeout, u8, DEFAULT_CONNECTION_TIMEOUT);
 serde_default!(default_max_lifetime, u32, DEFAULT_MAX_LIFETIME);
 serde_default!(default_idle_timeout, u32, DEFAULT_IDLE_TIMEOUT);
 serde_default!(default_check_health, bool, DEFAULT_CHECK_HEALTH);
-const DEFAULT_MAX_CONNECTIONS: u32 = 100;
-const DEFAULT_MIN_CONNECTIONS: u32 = 100;
+const DEFAULT_MAX_CONNECTIONS: u32 = 151;
+const DEFAULT_MIN_CONNECTIONS: u32 = 10;
 const DEFAULT_CONNECTION_TIMEOUT: u8 = 8;
-const DEFAULT_MAX_LIFETIME: u32 = 30;
-const DEFAULT_IDLE_TIMEOUT: u32 = 8;
-const DEFAULT_CHECK_HEALTH: bool = true;
+const DEFAULT_MAX_LIFETIME: u32 = 1800;
+const DEFAULT_IDLE_TIMEOUT: u32 = 60;
+const DEFAULT_CHECK_HEALTH: bool = false;
 
 impl Default for PoolModel {
     fn default() -> Self {
