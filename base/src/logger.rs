@@ -123,6 +123,7 @@ impl Logger {
                         .format(formatter.clone())
                         .level(level)
                         .filter(move |meta| match_target(meta.target(), &targets))
+                        .chain(std::io::stdout())
                         .chain(fern::DateBased::new(
                             &store_path,
                             format!("{}_{}.log", file_prefix, "%Y-%m-%d"),
