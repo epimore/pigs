@@ -26,6 +26,7 @@ struct DbModel {
     db_name: String,
     user: String,
     pass: String,
+    pass_crypto_enable: Option<bool>,
     attrs: Option<AttrsModel>,
     #[serde(default = "default_pool_model")]
     pool: PoolModel,
@@ -34,13 +35,18 @@ serde_default!(default_pool_model, PoolModel, PoolModel::default());
 impl DbModel {
     fn build_pool_conn() -> Pool<MySql> {
         let model: DbModel = DbModel::conf();
+       let password = if model.pass_crypto_enable.unwrap_or(false) {
+             &*default_decrypt( &*model.pass).expect("mysql pass invalid")
+        }else {
+           &*model.pass
+       };
         let mut conn_options = <<MySql as sqlx::Database>::Connection as Connection>::Options::new()
             .host(&*model.host_or_ip)
             .port(model.port)
             .database(&*model.db_name)
             .pipes_as_concat(false)
             .username(&*model.user)
-            .password(&*default_decrypt(&*model.pass).expect("mysql pass invalid"));
+            .password(password);
         if let Some(attr) = model.attrs {
             if let Some(log) = attr.log_global_sql_level {
                 let level = logger::level_filter(&*log);
