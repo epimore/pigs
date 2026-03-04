@@ -24,5 +24,5 @@ pub use serde_yaml;
 pub mod net;
 pub mod daemon;
 pub mod bus;
-mod cache;
+pub mod cache;
 
