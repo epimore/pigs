@@ -11,6 +11,7 @@ pub use cfg_lib;
 pub use exception;
 pub use ctor;
 pub use dashmap;
+pub use futures;
 
 pub use constructor;
 pub mod logger;
