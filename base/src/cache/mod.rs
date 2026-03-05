@@ -9,6 +9,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::mpsc::{channel, Sender};
+use tokio::sync::Semaphore;
 use tokio_util::time::{delay_queue::Key, DelayQueue};
 
 static COMMON_CACHE: Lazy<Cache> = Lazy::new(Cache::init);
@@ -112,7 +113,7 @@ impl Cache {
                         }
                     }
 
-                    expired = delay_queue.next() => {
+                    expired = delay_queue.next(), if !delay_queue.is_empty()  => {
                         if let Some(expired) = expired {
                             let key = expired.into_inner();
                             if let Some((_, value)) = purge_shared.map.remove(&key) {
@@ -131,16 +132,22 @@ impl Cache {
         // spawn async expire_call worker
         let cancellation_token_call = rt.cancel;
         rt.rt_handle.spawn(async move {
+            let semaphore = Arc::new(Semaphore::new(100));
             loop {
                 tokio::select! {
-                    _ = cancellation_token_call.cancelled() => break,
-                    res = call_rx.recv() => {
-                        match res{
-                            None => {break}
-                            Some(entity) => {
-                                tokio::spawn(async move{entity.expire_call().await;});
+                _ = cancellation_token_call.cancelled() => break,
+                Some(entity) = call_rx.recv() => {
+                        let permit = match semaphore.clone().acquire_owned().await {
+                            Ok(p) => p,
+                            Err(e) => {
+                                error!("Failed to acquire semaphore: {}", e);
+                                continue;
                             }
-                        }
+                        };
+                        tokio::spawn(async move{
+                            let _permit = permit;
+                            entity.expire_call().await;
+                        });
                     }
                 }
             }
@@ -153,16 +160,17 @@ impl Cache {
         self.shared.map.get(key).map(|v| v.value().clone())
     }
     pub async fn insert(&self, key: String, value: CachedValue) {
+        let ttl = value.expire_ttl();
+        self.shared.map.insert(key.clone(), value);
         let _ = self
             .shared
             .cmd_tx
             .send(DelayCommand::Insert {
-                key: key.clone(),
-                ttl: value.expire_ttl(),
+                key,
+                ttl,
             })
             .await
             .hand_log(|msg| error!("cmd channel close: {msg}"));
-        self.shared.map.insert(key, value);
     }
 
     pub async fn remove(&self, key: &str) -> Option<CachedValue> {
@@ -198,8 +206,6 @@ impl Cache {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::Mutex;
-    use std::time::Instant;
     use tokio::time::{sleep, timeout};
 
     // 测试用的 Mock 数据
@@ -369,7 +375,6 @@ mod tests {
         let mock = MockCacheable::new("refresh_test", Some(Duration::from_millis(200)));
         let expire_called = mock.expire_called.clone();
         let value = CachedValue(Arc::new(mock));
-
         cache.insert(key.clone(), value).await;
 
         // 等待一段时间但不过期
@@ -753,12 +758,18 @@ mod tests {
 
         let key = "replace".to_string();
 
-        let v1 = CachedValue(Arc::new(MockCacheable::new("v1", Some(Duration::from_millis(100)))));
+        let v1 = CachedValue(Arc::new(MockCacheable::new(
+            "v1",
+            Some(Duration::from_millis(100)),
+        )));
         cache.insert(key.clone(), v1).await;
 
         sleep(Duration::from_millis(50)).await;
 
-        let v2 = CachedValue(Arc::new(MockCacheable::new("v2", Some(Duration::from_secs(5)))));
+        let v2 = CachedValue(Arc::new(MockCacheable::new(
+            "v2",
+            Some(Duration::from_secs(5)),
+        )));
         cache.insert(key.clone(), v2).await;
 
         sleep(Duration::from_millis(150)).await;
