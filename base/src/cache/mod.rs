@@ -15,6 +15,9 @@ use tokio_util::time::{delay_queue::Key, DelayQueue};
 static COMMON_CACHE: Lazy<Cache> = Lazy::new(Cache::init);
 pub struct CommonCache;
 impl CommonCache {
+    pub fn contains_key(&self, key: &str) -> bool {
+        COMMON_CACHE.contains_key(key)
+    }
     pub async fn insert(key: String, value: CachedValue) {
         COMMON_CACHE.insert(key, value).await;
     }
@@ -156,6 +159,10 @@ impl Cache {
     }
 }
 impl Cache {
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.shared.map.contains_key(key)
+    }
+
     pub fn get(&self, key: &str) -> Option<CachedValue> {
         self.shared.map.get(key).map(|v| v.value().clone())
     }
