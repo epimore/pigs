@@ -85,4 +85,8 @@ mod test{
         let string = generate_token(text);
         println!("{}",string);
     }
+    #[test]
+    fn t4(){
+        println!("{}",default_decrypt("clRXVjIzU1VrS3BEMXZmNxp5adMgQy599aQeu0tHYg0=").unwrap());
+    }
 }

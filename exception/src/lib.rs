@@ -56,13 +56,13 @@ where
 {
     fn hand_log<O: FnOnce(String)>(self, op: O) -> GlobalResult<T> {
         self.map_err(|e| {
-            op(format!("source err = [{e:?}]"));
+            op(format!("Trace = [{e:?}]"));
             GlobalError::SysErr(anyhow::Error::from(e))
         })
     }
     fn hand_biz_log<O: FnOnce(String)>(self, code: u16, msg: &str, op: O) -> GlobalResult<T> {
         self.map_err(|e| {
-            op(format!("biz err = [code = {code}, msg=\"{msg}\"]; source = [{e:?}]"));
+            op(format!("Trace = [code = {code}, msg=\"{msg}\"]; source = [{e:?}]"));
             GlobalError::BizErr(BizError {
                 code,
                 msg: msg.to_string(),

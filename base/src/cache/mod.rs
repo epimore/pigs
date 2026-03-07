@@ -8,27 +8,27 @@ use once_cell::sync::Lazy;
 use std::any::Any;
 use std::collections::HashMap;
 use std::{sync::Arc, time::Duration};
-use tokio::sync::mpsc::{channel, Sender};
-use tokio::sync::Semaphore;
+use tokio::sync::mpsc::{channel, Sender, UnboundedSender};
+use tokio::sync::{mpsc, Semaphore};
 use tokio_util::time::{delay_queue::Key, DelayQueue};
 
 static COMMON_CACHE: Lazy<Cache> = Lazy::new(Cache::init);
 pub struct CommonCache;
 impl CommonCache {
-    pub fn contains_key(&self, key: &str) -> bool {
+    pub fn contains_key(key: &str) -> bool {
         COMMON_CACHE.contains_key(key)
     }
-    pub async fn insert(key: String, value: CachedValue) {
-        COMMON_CACHE.insert(key, value).await;
+    pub fn insert(key: String, value: CachedValue) {
+        COMMON_CACHE.insert(key, value);
     }
     pub fn get(key: &str) -> Option<CachedValue> {
         COMMON_CACHE.get(key)
     }
-    pub async fn remove(key: &str) -> Option<CachedValue> {
-        COMMON_CACHE.remove(key).await
+    pub fn remove(key: &str) -> Option<CachedValue> {
+        COMMON_CACHE.remove(key)
     }
-    pub async fn refresh(key: &str) {
-        COMMON_CACHE.refresh(key).await;
+    pub fn refresh(key: &str) {
+        COMMON_CACHE.refresh(key);
     }
 }
 
@@ -43,6 +43,9 @@ pub trait Cacheable: Send + Sync + Any + 'static {
 #[derive(Clone)]
 pub struct CachedValue(Arc<dyn Cacheable>);
 impl CachedValue {
+    pub fn from_any(value: Arc<dyn Cacheable>) -> Self {
+        CachedValue(value)
+    }
     pub fn downcast_ref<T: Any>(&self) -> Option<&T> {
         (self.0.as_ref() as &dyn Any).downcast_ref::<T>()
     }
@@ -64,7 +67,7 @@ enum DelayCommand {
 
 struct Shared {
     map: DashMap<String, CachedValue>,
-    cmd_tx: Sender<DelayCommand>,
+    cmd_tx: UnboundedSender<DelayCommand>,
     call_tx: Sender<CachedValue>,
 }
 
@@ -73,7 +76,7 @@ pub struct Cache {
 }
 impl Cache {
     pub fn init() -> Self {
-        let (cmd_tx, mut cmd_rx) = channel::<DelayCommand>(10000);
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<DelayCommand>();
         let (call_tx, mut call_rx) = channel::<CachedValue>(10000);
 
         let shared = Arc::new(Shared {
@@ -95,13 +98,21 @@ impl Cache {
                     Some(cmd) = cmd_rx.recv() => {
                         match cmd {
                             DelayCommand::Insert { key, ttl } => {
-                                if let Some(k) = key_map.remove(&key) {
-                                    delay_queue.remove(&k);
+                                match ttl{
+                                    None => {
+                                        if let Some(token) = key_map.remove(&key) {
+                                            delay_queue.remove(&token);
+                                        }
+                                    }
+                                    Some(ttl) => {
+                                        if let Some(token) = key_map.get(&key) {
+                                            delay_queue.reset(token, ttl);
+                                        } else {
+                                            let token = delay_queue.insert(key.clone(), ttl);
+                                            key_map.insert(key, token);
+                                        }
+                                    }
                                 }
-                                ttl.map(|ttl|{
-                                     let key_token = delay_queue.insert(key.clone(), ttl);
-                                     key_map.insert(key, key_token);
-                                });
                             }
                             DelayCommand::Remove { key } => {
                                  if let Some(k) = key_map.remove(&key) {
@@ -116,13 +127,12 @@ impl Cache {
                         }
                     }
 
-                    expired = delay_queue.next(), if !delay_queue.is_empty()  => {
-                        if let Some(expired) = expired {
-                            let key = expired.into_inner();
-                            if let Some((_, value)) = purge_shared.map.remove(&key) {
-                                // async worker 执行 expire_call
-                                let _ = purge_shared.call_tx.try_send(value).hand_log(|msg| error!("Cache call channel error: {msg}"));
-                            }
+                    Some(expired) = delay_queue.next()  => {
+                        let key = expired.into_inner();
+                        key_map.remove(&key);
+                        if let Some((_, value)) = purge_shared.map.remove(&key) {
+                            // async worker 执行 expire_call
+                            let _ = purge_shared.call_tx.try_send(value).hand_log(|msg| error!("Cache call channel error: {msg}"));
                         }
                     }
                 }
@@ -166,33 +176,28 @@ impl Cache {
     pub fn get(&self, key: &str) -> Option<CachedValue> {
         self.shared.map.get(key).map(|v| v.value().clone())
     }
-    pub async fn insert(&self, key: String, value: CachedValue) {
+    pub fn insert(&self, key: String, value: CachedValue) {
         let ttl = value.expire_ttl();
         self.shared.map.insert(key.clone(), value);
         let _ = self
             .shared
             .cmd_tx
-            .send(DelayCommand::Insert {
-                key,
-                ttl,
-            })
-            .await
+            .send(DelayCommand::Insert { key, ttl })
             .hand_log(|msg| error!("cmd channel close: {msg}"));
     }
 
-    pub async fn remove(&self, key: &str) -> Option<CachedValue> {
+    pub fn remove(&self, key: &str) -> Option<CachedValue> {
         let _ = self
             .shared
             .cmd_tx
             .send(DelayCommand::Remove {
                 key: key.to_string(),
             })
-            .await
             .hand_log(|msg| error!("cmd channel close: {msg}"));
         self.shared.map.remove(key).map(|(_, v)| v)
     }
 
-    pub async fn refresh(&self, key: &str) {
+    pub fn refresh(&self, key: &str) {
         if let Some(value) = self.shared.map.get(key) {
             if let Some(ttl) = value.expire_ttl() {
                 let _ = self
@@ -202,7 +207,6 @@ impl Cache {
                         key: key.to_string(),
                         ttl,
                     })
-                    .await
                     .hand_log(|msg| error!("cmd channel close: {msg}"));
             }
         }
@@ -295,7 +299,7 @@ mod tests {
         let mock = MockCacheable::new("test", Some(Duration::from_secs(60)));
         let value = CachedValue(Arc::new(mock));
 
-        cache.insert(key.clone(), value.clone()).await;
+        cache.insert(key.clone(), value.clone());
 
         let retrieved = cache.get(&key);
         assert!(retrieved.is_some());
@@ -321,10 +325,10 @@ mod tests {
         let mock = MockCacheable::new("test", Some(Duration::from_secs(60)));
         let value = CachedValue(Arc::new(mock));
 
-        cache.insert(key.clone(), value).await;
+        cache.insert(key.clone(), value);
         assert!(cache.get(&key).is_some());
 
-        let removed = cache.remove(&key).await;
+        let removed = cache.remove(&key);
         assert!(removed.is_some());
         assert!(cache.get(&key).is_none());
         let cached_value = removed.unwrap();
@@ -343,7 +347,7 @@ mod tests {
         // 包装 mock 以便共享计数器
         let value = CachedValue(Arc::new(mock));
 
-        cache.insert(key.clone(), value).await;
+        cache.insert(key.clone(), value);
         assert!(cache.get(&key).is_some());
 
         // 等待过期
@@ -364,7 +368,7 @@ mod tests {
         let mock = MockCacheable::new("no_expire", None);
         let value = CachedValue(Arc::new(mock));
 
-        cache.insert(key.clone(), value).await;
+        cache.insert(key.clone(), value);
         assert!(cache.get(&key).is_some());
 
         // 等待一段时间
@@ -382,13 +386,13 @@ mod tests {
         let mock = MockCacheable::new("refresh_test", Some(Duration::from_millis(200)));
         let expire_called = mock.expire_called.clone();
         let value = CachedValue(Arc::new(mock));
-        cache.insert(key.clone(), value).await;
+        cache.insert(key.clone(), value);
 
         // 等待一段时间但不过期
         sleep(Duration::from_millis(150)).await;
 
         // 刷新
-        cache.refresh(&key).await;
+        cache.refresh(&key);
 
         // 再等待超过原始过期时间
         sleep(Duration::from_millis(150)).await;
@@ -419,8 +423,8 @@ mod tests {
         let expire_called2 = mock2.expire_called.clone();
         let value2 = CachedValue(Arc::new(mock2));
 
-        cache.insert(key.clone(), value1).await;
-        cache.insert(key.clone(), value2).await;
+        cache.insert(key.clone(), value1);
+        cache.insert(key.clone(), value2);
 
         let retrieved = cache.get(&key).unwrap();
         let mock = get_mock_from_cached(&retrieved).unwrap();
@@ -445,7 +449,7 @@ mod tests {
                 let key = format!("key_{}", i);
                 let mock = MockCacheable::new(&key, Some(Duration::from_secs(60)));
                 let value = CachedValue(Arc::new(mock));
-                cache.insert(key, value).await;
+                cache.insert(key, value);
             }));
         }
 
@@ -468,7 +472,7 @@ mod tests {
                 let key = format!("key_{}", i);
                 let _ = cache.get(&key);
                 if i % 2 == 0 {
-                    cache.remove(&key).await;
+                    cache.remove(&key);
                 }
             }));
         }
@@ -498,10 +502,10 @@ mod tests {
             let mock = MockCacheable::new(&key, Some(Duration::from_secs(60)));
             let value = CachedValue(Arc::new(mock));
 
-            cache.insert(key.clone(), value).await;
+            cache.insert(key.clone(), value);
             assert!(cache.get(&key).is_some());
 
-            let removed = cache.remove(&key).await;
+            let removed = cache.remove(&key);
             assert!(removed.is_some());
             assert!(cache.get(&key).is_none());
         }
@@ -525,10 +529,10 @@ mod tests {
         let none_mock = MockCacheable::new("none", None);
         let none = CachedValue(Arc::new(none_mock));
 
-        cache.insert("short".to_string(), short).await;
-        cache.insert("medium".to_string(), medium).await;
-        cache.insert("long".to_string(), long).await;
-        cache.insert("none".to_string(), none).await;
+        cache.insert("short".to_string(), short);
+        cache.insert("medium".to_string(), medium);
+        cache.insert("long".to_string(), long);
+        cache.insert("none".to_string(), none);
 
         // 等待短过期
         sleep(Duration::from_millis(200)).await;
@@ -558,12 +562,12 @@ mod tests {
         let expire_called = mock.expire_called.clone();
         let value = CachedValue(Arc::new(mock));
 
-        cache.insert(key.clone(), value).await;
+        cache.insert(key.clone(), value);
 
         // 多次刷新
         for _ in 0..5 {
             sleep(Duration::from_millis(150)).await;
-            cache.refresh(&key).await;
+            cache.refresh(&key);
             assert!(cache.get(&key).is_some());
         }
 
@@ -578,7 +582,7 @@ mod tests {
     #[tokio::test]
     async fn test_remove_nonexistent() {
         let cache = Cache::init();
-        let removed = cache.remove("nonexistent").await;
+        let removed = cache.remove("nonexistent");
         assert!(removed.is_none());
     }
 
@@ -587,7 +591,7 @@ mod tests {
     async fn test_refresh_nonexistent() {
         let cache = Cache::init();
         // 刷新不存在的 key 不应该 panic
-        cache.refresh("nonexistent").await;
+        cache.refresh("nonexistent");
     }
 
     // 测试 expire_call panic 的处理
@@ -598,7 +602,7 @@ mod tests {
         let mock = MockCacheable::with_panic("panic_test", Some(Duration::from_millis(100)));
         let value = CachedValue(Arc::new(mock));
 
-        cache.insert(key.clone(), value).await;
+        cache.insert(key.clone(), value);
         assert!(cache.get(&key).is_some());
 
         // 等待过期，expire_call 会 panic，但不应影响 cache 运行
@@ -611,7 +615,7 @@ mod tests {
         let new_key = "new_key".to_string();
         let new_mock = MockCacheable::new("new", Some(Duration::from_secs(60)));
         let new_value = CachedValue(Arc::new(new_mock));
-        cache.insert(new_key.clone(), new_value).await;
+        cache.insert(new_key.clone(), new_value);
         assert!(cache.get(&new_key).is_some());
     }
 
@@ -624,7 +628,7 @@ mod tests {
         let value = CachedValue(Arc::new(mock));
 
         let result = timeout(Duration::from_millis(100), async {
-            cache.insert(key.clone(), value).await;
+            cache.insert(key.clone(), value);
             cache.get(&key)
         })
         .await;
@@ -647,7 +651,7 @@ mod tests {
             let value = CachedValue(Arc::new(mock));
             let key = format!("mass_key_{}", i);
 
-            cache.insert(key, value).await;
+            cache.insert(key, value);
         }
 
         // 等待过期
@@ -676,7 +680,7 @@ mod tests {
         let mock = MockCacheable::new("hot", Some(Duration::from_millis(200)));
         let value = CachedValue(Arc::new(mock));
 
-        cache.insert(key.clone(), value).await;
+        cache.insert(key.clone(), value);
 
         let mut handles = vec![];
         for _ in 0..10 {
@@ -697,7 +701,7 @@ mod tests {
             async move {
                 for _ in 0..20 {
                     sleep(Duration::from_millis(30)).await;
-                    cache.refresh(&key).await;
+                    cache.refresh(&key);
                 }
             }
         });
@@ -733,7 +737,7 @@ mod tests {
         for i in 0..10 {
             let mock = MockCacheable::new(&format!("value_{}", i), Some(Duration::from_secs(60)));
             let value = CachedValue(Arc::new(mock));
-            cache.insert(key.clone(), value).await;
+            cache.insert(key.clone(), value);
 
             let retrieved = cache.get(&key).unwrap();
             let mock = get_mock_from_cached(&retrieved).unwrap();
@@ -750,7 +754,7 @@ mod tests {
         let expire_called = mock.expire_called.clone();
         let value = CachedValue(Arc::new(mock));
 
-        cache.insert(key.clone(), value).await;
+        cache.insert(key.clone(), value);
 
         // 立即检查应该已经过期
         sleep(Duration::from_millis(50)).await;
@@ -769,7 +773,7 @@ mod tests {
             "v1",
             Some(Duration::from_millis(100)),
         )));
-        cache.insert(key.clone(), v1).await;
+        cache.insert(key.clone(), v1);
 
         sleep(Duration::from_millis(50)).await;
 
@@ -777,7 +781,7 @@ mod tests {
             "v2",
             Some(Duration::from_secs(5)),
         )));
-        cache.insert(key.clone(), v2).await;
+        cache.insert(key.clone(), v2);
 
         sleep(Duration::from_millis(150)).await;
 
