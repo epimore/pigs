@@ -1,3 +1,5 @@
+mod c100k;
+
 use crate::utils::rt::GlobalRuntime;
 use dashmap::DashMap;
 use exception::GlobalResultExt;

@@ -37,7 +37,9 @@ hex = "0.4"
 sha2 = "0.10"
 tokio-util = {version = "0.7",features = ["full"]}
 futures = "0.3"
-
+ahash = "0.8"
+slab = "0.4"
+crossbeam = "0.8"
 
 # Unix-like 系统（Linux + macOS）
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
