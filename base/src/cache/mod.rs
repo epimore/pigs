@@ -1,4 +1,4 @@
-mod c100k;
+pub mod c100k;
 
 use crate::utils::rt::GlobalRuntime;
 use dashmap::DashMap;
