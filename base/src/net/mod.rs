@@ -11,6 +11,7 @@ mod tcp;
 mod core;
 pub mod state;
 pub mod sdx;
+pub mod reader;
 
 #[cfg(feature = "net")]
 pub async fn init_net(protocol: state::Protocol, socket_addr: SocketAddr) -> GlobalResult<(Sender<Zip>, Receiver<Zip>)> {

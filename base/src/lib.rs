@@ -12,6 +12,8 @@ pub use exception;
 pub use ctor;
 pub use dashmap;
 pub use futures;
+pub use smallvec;
+pub use ahash;
 
 pub use constructor;
 pub mod logger;

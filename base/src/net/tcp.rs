@@ -66,7 +66,7 @@ pub async fn accept(
 }
 const MAX_BACKOFF_MS: u64 = 3000; // 最大退避 3 秒
 //连接检测
-async fn check_accept(tcp_listener: &TcpListener) -> Result<(TcpStream, SocketAddr), Error> {
+pub async fn check_accept(tcp_listener: &TcpListener) -> Result<(TcpStream, SocketAddr), Error> {
     let mut backoff_ms = 10;
     loop {
         match tcp_listener.accept().await {
