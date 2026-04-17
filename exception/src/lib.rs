@@ -1,7 +1,6 @@
-pub mod code;
 pub mod typed;
 
-use std::fmt::{Display, Formatter};
+use std::fmt::{Arguments, Display, Formatter};
 
 use anyhow::{self, Error as AnyhowError};
 use thiserror::Error;
@@ -31,6 +30,9 @@ impl GlobalError {
 }
 
 /// 业务错误结构体
+/// A保留：0..999;B对外暴露:1000..9999；C系统自用:10000..65535；
+/// 1000..1099网络异常
+/// 1100..1199数据异常
 #[derive(Debug, Clone)]
 pub struct BizError {
     pub code: u16,
@@ -45,28 +47,37 @@ impl Display for BizError {
 }
 
 /// 错误处理扩展 trait
-pub trait GlobalResultExt<T> {
-    fn hand_log<O: FnOnce(String)>(self, op: O) -> GlobalResult<T>;
-    fn hand_biz_log<O: FnOnce(String)>(self, code: u16, msg: &str, op: O) -> GlobalResult<T>;
-}
-
 impl<T, E> GlobalResultExt<T> for Result<T, E>
 where
     E: std::error::Error + Send + Sync + 'static,
 {
-    fn hand_log<O: FnOnce(String)>(self, op: O) -> GlobalResult<T> {
+    fn hand_log<O: FnOnce(Arguments)>(self, op: O) -> GlobalResult<T> {
         self.map_err(|e| {
-            op(format!("Trace = [{e:?}]"));
+            op(format_args!("Trace = [{e:?}]"));
             GlobalError::SysErr(anyhow::Error::from(e))
         })
     }
-    fn hand_biz_log<O: FnOnce(String)>(self, code: u16, msg: &str, op: O) -> GlobalResult<T> {
+
+    fn hand_log_str<O: FnOnce(&str)>(self, op: O) -> GlobalResult<T> {
         self.map_err(|e| {
-            op(format!("Trace = [code = {code}, msg=\"{msg}\"]; source = [{e:?}]"));
+            op(&format!("Trace = [{e:?}]"));
+            GlobalError::SysErr(anyhow::Error::from(e))
+        })
+    }
+
+    fn hand_biz_log<O: FnOnce(&str)>(self, code: u16, msg: &str, op: O) -> GlobalResult<T> {
+        self.map_err(|e| {
+            op(&format!("Trace = [code = {code}, msg=\"{msg}\"]; source = [{e:?}]"));
             GlobalError::BizErr(BizError {
                 code,
                 msg: msg.to_string(),
             })
         })
     }
+}
+
+pub trait GlobalResultExt<T> {
+    fn hand_log<O: FnOnce(std::fmt::Arguments)>(self, op: O) -> GlobalResult<T>;
+    fn hand_log_str<O: FnOnce(&str)>(self, op: O) -> GlobalResult<T>;
+    fn hand_biz_log<O: FnOnce(&str)>(self, code: u16, msg: &str, op: O) -> GlobalResult<T>;
 }

@@ -18,7 +18,8 @@ pub use ahash;
 pub use constructor;
 pub mod logger;
 pub mod utils;
-
+pub use paste;
+pub use inventory;
 pub use serde_json;
 pub use serde;
 pub use serde_yaml;
@@ -28,4 +29,5 @@ pub mod net;
 pub mod daemon;
 pub mod bus;
 pub mod cache;
+pub mod err;
 
