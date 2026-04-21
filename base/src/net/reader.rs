@@ -2,12 +2,11 @@ use crate::net::state::Protocol;
 use bytes::{BufMut, Bytes, BytesMut};
 use exception::{GlobalResult, GlobalResultExt};
 use log::{debug, error, warn};
-use smallvec::SmallVec;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::{select};
+use tokio::select;
 use tokio_util::sync::CancellationToken;
 
 pub trait PacketDispatcher: Send + Sync + 'static {
@@ -18,28 +17,10 @@ pub trait PacketDispatcher: Send + Sync + 'static {
         protocol: Protocol,
     ) -> GlobalResult<()>;
 }
-//fn feed(&mut self, buf: &mut BytesMut) -> Vec<Bytes> {
-//     let mut out = Vec::new();
-//
-//     loop {
-//         if buf.len() < HEADER_LEN {
-//             break;
-//         }
-//
-//         let pkt_len = parse_len(&buf);
-//
-//         if buf.len() < pkt_len {
-//             break;
-//         }
-//
-//         let frame = buf.split_to(pkt_len).freeze();
-//         out.push(frame);
-//     }
-//
-//     out
-// }
+
 pub trait PacketSplitter: Send + 'static {
-    fn feed(&mut self, chunk: &mut BytesMut) -> SmallVec<[Bytes; 8]>;
+    fn feed<F>(&mut self, chunk: &mut BytesMut, f: F)-> GlobalResult<()>
+    where F: FnMut(Bytes) -> GlobalResult<()>;
 }
 const MAX_BUF_SIZE: usize = 2 * 1024 * 1024;
 pub fn reader<D, S>(
@@ -116,11 +97,8 @@ where
     S: PacketSplitter,
 {
     let mut buf = BytesMut::with_capacity(64 * 1024);
-
     loop {
         select! {
-            biased;
-
             res = tcp_stream_read_buf(&mut buf,&mut stream) => {
                 match res {
                     Ok(0) => break,
@@ -135,13 +113,10 @@ where
                 };
 
                 // 拆包
-                let packets = splitter.feed(&mut buf);
-
-                for pkt in packets {
-                    dispatcher.dispatch(pkt, remote_addr, Protocol::TCP)?;
-                }
+                splitter.feed(&mut buf, |pkt| {
+                    dispatcher.dispatch(pkt, remote_addr, Protocol::TCP)
+                })?;
             }
-
             _ = cancel.cancelled() => break,
         }
     }
@@ -172,8 +147,6 @@ where
         let mut buf = BytesMut::with_capacity(2048);
         loop {
             select! {
-                biased;
-
                 Ok((n,addr)) = udp_socket_read_buf(&mut buf,&socket)=>{
                     if n!=0{
                         let data = buf.split().freeze();

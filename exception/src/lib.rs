@@ -18,13 +18,13 @@ pub enum GlobalError {
 }
 
 impl GlobalError {
-    pub fn new_biz_error<O: FnOnce(String)>(code: u16, msg: &str, op: O) -> Self {
-        op(format!("biz err = [code = {code}, msg=\"{msg}\"]"));
+    pub fn new_biz_error<O: FnOnce(Arguments)>(code: u16, msg: &str, op: O) -> Self {
+        op(format_args!("biz err = [code = {code}, msg=\"{msg}\"]"));
         Self::BizErr(BizError { code, msg: msg.to_string() })
     }
 
-    pub fn new_sys_error<O: FnOnce(String)>(msg: &str, op: O) -> Self {
-        op(format!("sys err = [{msg}]"));
+    pub fn new_sys_error<O: FnOnce(Arguments)>(msg: &str, op: O) -> Self {
+        op(format_args!("sys err = [{msg}]"));
         Self::SysErr(anyhow::anyhow!("{}", msg))
     }
 }
