@@ -1,31 +1,28 @@
+use proc_macro::TokenStream;
 use proc_macro2::{Ident, TokenTree};
 use quote::{format_ident, quote};
-use syn::{DeriveInput};
-use proc_macro::TokenStream;
+use syn::{Data, DeriveInput, Fields};
 
 /// ```example
-/// #[conf(path="可选",prefix="可选",data_type="可选",lib="可选",check=[true,false]可选)]
-/// struct T{ xxx}
-/// impl struct{
-///   fn test()->Self{
-///     T::conf()
-///   }
-/// }
+/// #[conf(path = "optional", prefix = "optional", data_type = "optional", lib = "optional", check, default)]
+/// struct T { ... }
 /// ```
-/// attributes(path, prefix, data_type)
-/// 配合serde 从指定文件中format数据到struct；
-/// path:指定文件 默认读取配置文件;
-/// prefix: 指定字段数据 默认无;
-/// data_type: 文件类型 默认yaml,暂仅支持yaml;
-/// lib 指定yml与cfg_lib库。默认使用common
-///check 初始化struct时，默认None,不校验。some(true)开启自定义字段检查；需手动实现trait cfg_lib::CheckFromConf
+///
+/// Attributes:
+/// - `path`: target file path.
+/// - `prefix`: nested yaml key path split by `.`.
+/// - `data_type`: defaults to yaml.
+/// - `lib`: use external crate path, empty means current crate.
+/// - `check`: run `CheckFromConf::_field_check`.
+/// - `default`: enabled by default; It is only disabled when default = "false".
+///    Use #[serde(default = "...")] or #[serde(default)] to set default value for a field.
 #[proc_macro_attribute]
 pub fn conf(attrs: TokenStream, item: TokenStream) -> TokenStream {
     let ast: DeriveInput = syn::parse(item).expect("syn parse item failed");
     let attr = parse_attr(attrs);
     let struct_name = &ast.ident;
     let register_constructor = build_register_constructor(&attr, struct_name);
-    let token_stream = build_conf_constructor(attr);
+    let token_stream = build_conf_constructor(attr, &ast);
     let (i, t, w) = ast.generics.split_for_impl();
     let fun = quote! {
         #ast
@@ -34,65 +31,58 @@ pub fn conf(attrs: TokenStream, item: TokenStream) -> TokenStream {
         }
         #register_constructor
     };
-    // println!("{}", &fun.to_string());
     fun.into()
 }
 
 fn build_register_constructor(attr: &ConAttr, struct_name: &Ident) -> proc_macro2::TokenStream {
+    if attr.path.is_some() {
+        return quote! {};
+    }
+
     let check = if attr.check {
         quote! {
-                    #struct_name::conf()._field_check()
-                }
+            #struct_name::conf()._field_check()
+        }
     } else {
         quote! {
-                   {
-                       let _ = #struct_name::conf();
-                       Ok(())
-                   }
-                }
+            {
+                let _ = #struct_name::conf();
+                Ok(())
+            }
+        }
     };
-    let reg_ins = format_ident!("register_instance_{}", camel_to_snake(struct_name.to_string().as_str()));
+    let reg_ins = format_ident!(
+        "register_instance_{}",
+        camel_to_snake(struct_name.to_string().as_str())
+    );
     match &attr.lib {
         None => quote! {
             #[base::ctor::ctor]
             fn #reg_ins() {
-               base::cfg_lib::conf::register_function(std::any::type_name::<#struct_name>(), || { #check });
+                base::cfg_lib::conf::register_function(std::any::type_name::<#struct_name>(), || { #check });
             }
-    },
+        },
         Some(lib) if !lib.is_empty() => {
-            let lib_path: syn::Path = syn::parse_str(lib).expect("解析库路径失败");
+            let lib_path: syn::Path = syn::parse_str(lib).expect("parse lib path failed");
             quote! {
-            #[#lib_path::ctor::ctor]
-            fn #reg_ins() {
-               #lib_path::cfg_lib::conf::register_function(std::any::type_name::<#struct_name>(), || { #check });
+                #[#lib_path::ctor::ctor]
+                fn #reg_ins() {
+                    #lib_path::cfg_lib::conf::register_function(std::any::type_name::<#struct_name>(), || { #check });
+                }
             }
-        }
         }
         _ => {
-            match attr.path {
-                None => {
-                    quote! {
-                        #[ctor::ctor]
-                        fn #reg_ins() {
-                            cfg_lib::conf::register_function(std::any::type_name::<#struct_name>(), || #check);
-                        }
-                    }
-                }
-                Some(_) => {
-                    quote! {
-                        #[ctor::ctor]
-                        fn #reg_ins(){
-                            let res:Result<(), cfg_lib::conf::FieldCheckError> = #check;
-                            res.expect("实例化配置文件失败");
-                        }
-                    }
+            quote! {
+                #[ctor::ctor]
+                fn #reg_ins() {
+                    cfg_lib::conf::register_function(std::any::type_name::<#struct_name>(), || #check);
                 }
             }
         }
     }
 }
 
-fn build_conf_constructor(attr: ConAttr) -> proc_macro2::TokenStream {
+fn build_conf_constructor(attr: ConAttr, ast: &DeriveInput) -> proc_macro2::TokenStream {
     let fn_body_path;
     let fn_body_prefix;
     let fn_body_data_type;
@@ -102,17 +92,23 @@ fn build_conf_constructor(attr: ConAttr) -> proc_macro2::TokenStream {
         None => {
             fn_body_use_lib = quote! {
                 use base::cfg_lib;
+                use base::serde;
                 use base::serde_yaml;
             };
         }
         Some(lib) => {
             if !lib.is_empty() {
-                let lib_path: syn::Path = syn::parse_str(&lib).expect("解析库路径失败");
+                let lib_path: syn::Path = syn::parse_str(&lib).expect("parse lib path failed");
                 fn_body_use_lib = quote! {
-                use #lib_path::cfg_lib;
-                use #lib_path::serde_yaml;
-            };
-            } else { fn_body_use_lib = quote! {} }
+                    use #lib_path::cfg_lib;
+                    use #lib_path::serde;
+                    use #lib_path::serde_yaml;
+                };
+            } else {
+                fn_body_use_lib = quote! {
+                    use serde;
+                };
+            }
         }
     }
 
@@ -145,7 +141,8 @@ fn build_conf_constructor(attr: ConAttr) -> proc_macro2::TokenStream {
                 let mut target_value = &yaml_value;
                 for key in #prefix.split('.') {
                     if let serde_yaml::Value::Mapping(map) = target_value {
-                        target_value = map.get(&serde_yaml::Value::String(key.to_string()))
+                        target_value = map
+                            .get(&serde_yaml::Value::String(key.to_string()))
                             .expect("Specified prefix not found in YAML");
                     } else {
                         panic!("Invalid YAML structure for the specified prefix");
@@ -157,13 +154,17 @@ fn build_conf_constructor(attr: ConAttr) -> proc_macro2::TokenStream {
 
     match attr.data_type.as_deref() {
         None | Some("YAML") => {
-            fn_body_data_type = quote! {
-                serde_yaml::from_value(target_value.clone())
-                    .expect("Failed to map YAML value to struct")
-            };
+            if attr.default {
+                fn_body_data_type = build_default_data_type(ast);
+            } else {
+                fn_body_data_type = quote! {
+                    serde_yaml::from_value(target_value.clone())
+                        .expect("Failed to map YAML value to struct")
+                };
+            }
         }
         Some(data_type) => {
-            panic!("暂不支持格式: {}", data_type);
+            panic!("unsupported data type: {}", data_type);
         }
     }
 
@@ -173,6 +174,54 @@ fn build_conf_constructor(attr: ConAttr) -> proc_macro2::TokenStream {
             #fn_body_path
             #fn_body_prefix
             #fn_body_data_type
+        }
+    }
+}
+
+fn build_default_data_type(ast: &DeriveInput) -> proc_macro2::TokenStream {
+    let fields = match &ast.data {
+        Data::Struct(struct_data) => match &struct_data.fields {
+            Fields::Named(named) => named.named.iter().collect::<Vec<_>>(),
+            _ => panic!("#[conf(default)] only supports named-field structs"),
+        },
+        _ => panic!("#[conf(default)] only supports structs"),
+    };
+
+    let proxy_name = format_ident!("__CfgMacroDefaultProxyFor{}", ast.ident);
+    let struct_serde_attrs = ast.attrs.iter().filter(|attr| attr.path().is_ident("serde"));
+
+    let proxy_fields = fields.iter().map(|field| {
+        let field_name = field.ident.as_ref().expect("named field");
+        let field_ty = &field.ty;
+        let serde_attrs = field
+            .attrs
+            .iter()
+            .filter(|attr| attr.path().is_ident("serde"));
+        quote! {
+            #(#serde_attrs)*
+            #field_name: #field_ty
+        }
+    });
+
+    let assign_fields = fields.iter().map(|field| {
+        let field_name = field.ident.as_ref().expect("named field");
+        quote! {
+            #field_name: __cfg_proxy.#field_name
+        }
+    });
+
+    quote! {
+        #[derive(serde::Deserialize)]
+        #(#struct_serde_attrs)*
+        struct #proxy_name {
+            #(#proxy_fields,)*
+        }
+
+        let __cfg_proxy: #proxy_name = serde_yaml::from_value(target_value.clone())
+            .expect("Failed to map YAML value to struct with defaults");
+
+        Self {
+            #(#assign_fields,)*
         }
     }
 }
@@ -188,14 +237,22 @@ fn parse_attr(attrs: TokenStream) -> ConAttr {
     for arg in args {
         match arg {
             TokenTree::Ident(ident) => {
-                key = ident.to_string();
+                let ident_str = ident.to_string();
+                if key.eq("default") && (ident_str.eq("true") || ident_str.eq("false")) {
+                    attr.default = !ident_str.eq("false");
+                    key.clear();
+                    continue;
+                }
+                key = ident_str;
                 if key.eq("lib") {
-                    attr.lib = Some("".to_string());
+                    attr.lib = Some(String::new());
                 } else if key.eq("check") {
                     attr.check = true;
+                } else if key.eq("default") {
+                    attr.default = true;
                 }
             }
-            TokenTree::Punct(_) => {} // 逗号等符号忽略
+            TokenTree::Punct(_) => {}
             TokenTree::Literal(lit) => {
                 let lit_str = lit.to_string();
                 let value = lit_str.trim_matches('"').to_string();
@@ -204,6 +261,13 @@ fn parse_attr(attrs: TokenStream) -> ConAttr {
                     "path" => attr.path = Some(value),
                     "prefix" => attr.prefix = Some(value),
                     "data_type" => attr.data_type = Some(value.to_uppercase()),
+                    "default" => {
+                        attr.default = match value.to_ascii_lowercase().as_str() {
+                            "false" => false,
+                            "true" => true,
+                            _ => panic!("invalid default attr value: {}", value),
+                        }
+                    }
                     other => panic!("invalid attr name: {}", other),
                 }
             }
@@ -213,13 +277,27 @@ fn parse_attr(attrs: TokenStream) -> ConAttr {
     attr
 }
 
-#[derive(Default, Debug)]
+#[derive(Debug)]
 struct ConAttr {
     path: Option<String>,
     prefix: Option<String>,
     data_type: Option<String>,
     lib: Option<String>,
     check: bool,
+    default: bool,
+}
+
+impl Default for ConAttr {
+    fn default() -> Self {
+        Self {
+            path: None,
+            prefix: None,
+            data_type: None,
+            lib: None,
+            check: false,
+            default: true,
+        }
+    }
 }
 
 fn camel_to_snake(s: &str) -> String {

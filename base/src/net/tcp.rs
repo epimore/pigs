@@ -1,8 +1,5 @@
 use crate::exception::{GlobalResult, GlobalResultExt};
-use crate::net::state::{
-    Association, Event, Gate, GateAccept, GateListener, Package, Protocol, Zip, SOCKET_BUFFER_SIZE,
-    TCP_HANDLE_MAP,
-};
+use crate::net::state::{Association, Event, Gate, GateAccept, GateListener, IoEventType, Package, Protocol, Zip, SOCKET_BUFFER_SIZE, TCP_HANDLE_MAP};
 use bytes::Bytes;
 use log::{debug, error, info, warn};
 use std::io::Error;
@@ -16,7 +13,7 @@ use tokio::{io, time};
 //创建tcp监听，并将监听句柄（内含读写句柄）发送出去
 //卸载监听 drop listen？
 pub async fn listen(gate: Gate) -> GlobalResult<GateListener> {
-    let local_addr = gate.get_local_addr().clone();
+    let local_addr = gate.local_addr;
     let tcp_listener = TcpListener::bind(local_addr)
         .await
         .hand_log(|msg| error!("{msg}"))?;
@@ -28,7 +25,7 @@ pub fn listen_by_std(
     gate: Gate,
     std_tcp_listener: std::net::TcpListener,
 ) -> GlobalResult<GateListener> {
-    debug!("tokio监听 TCP 地址： {}", gate.get_local_addr());
+    debug!("tokio监听 TCP 地址： {}", gate.local_addr);
     std_tcp_listener
         .set_nonblocking(true)
         .hand_log(|msg| error!("{msg}"))?;
@@ -44,7 +41,7 @@ pub async fn accept(
     accept_tx: Sender<GateAccept>,
     lone_output_tx: Sender<Zip>,
 ) -> GlobalResult<()> {
-    let local_addr = gate.get_local_addr().clone();
+    let local_addr = gate.local_addr;
     let gate_accept = check_accept(tcp_listener)
         .await
         .map(|(tcp_stream, remote_addr)| {
@@ -141,7 +138,7 @@ pub async fn read(
 
                     //断开连接移除持有句柄
                     TCP_HANDLE_MAP.remove(&association);
-                    let zip = Zip::build_event(Event::new(association, 0u8));
+                    let zip = Zip::build_event(Event::new(association, IoEventType::Close));
                     let _ = tx.send(zip).await;
                     break;
                 }
@@ -166,9 +163,9 @@ pub async fn write(mut writer: io::WriteHalf<TcpStream>, mut rx: Receiver<Zip>) 
     while let Some(zip) = rx.recv().await {
         match zip {
             Zip::Data(package) => {
-                let bytes = package.get_data();
-                let local_addr = package.get_association().get_local_addr();
-                let remote_addr = package.get_association().get_remote_addr();
+                let bytes = package.data;
+                let local_addr = package.association.local_addr;
+                let remote_addr = package.association.remote_addr;
                 match writer.write(&*bytes).await {
                     Ok(len) => {
                         debug!("【TCP write success】 【Local_addr = {:?}】 【Remote_addr = {:?}】 【len = {}】",
@@ -186,14 +183,14 @@ pub async fn write(mut writer: io::WriteHalf<TcpStream>, mut rx: Receiver<Zip>) 
                             remote_addr,
                             err
                             );
-                        TCP_HANDLE_MAP.remove(package.get_association());
+                        TCP_HANDLE_MAP.remove(&package.association);
                         break;
                     }
                 }
             }
             Zip::Event(event) => {
-                if event.type_code == 0 {
-                    TCP_HANDLE_MAP.remove(event.get_association());
+                if matches!(event.type_code,IoEventType::Close) {
+                    TCP_HANDLE_MAP.remove(&event.association);
                     break;
                 }
             }

@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use constructor::{Get, New, Set};
+use constructor::{New};
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use std::net::SocketAddr;
@@ -7,19 +7,23 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc::{Receiver, Sender};
 
 //TCP连接有状态，需要持有每个连接的句柄
-pub static TCP_HANDLE_MAP: Lazy<DashMap<Association, Sender<Zip>>> =
-    Lazy::new(|| DashMap::new());
+pub static TCP_HANDLE_MAP: Lazy<DashMap<Association, Sender<Zip>>> = Lazy::new(|| DashMap::new());
 pub const SOCKET_BUFFER_SIZE: usize = 4096;
 pub const CHANNEL_BUFFER_SIZE: usize = 10000;
 pub const UDP: &str = "UDP";
 pub const TCP: &str = "TCP";
 pub const ALL: &str = "ALL";
 
+#[derive(Debug)]
+pub enum IoEventType {
+    Close = 0,
+}
+
 ///type_code = 0 为连接断开
-#[derive(Debug, New, Set, Get)]
+#[derive(Debug, New)]
 pub struct Event {
     pub association: Association,
-    pub type_code: u8,
+    pub type_code: IoEventType,
 }
 
 impl Event {
@@ -31,7 +35,7 @@ impl Event {
         });
         Self {
             association,
-            type_code: 0,
+            type_code: IoEventType::Close,
         }
     }
 }
@@ -54,7 +58,7 @@ impl Protocol {
 }
 
 /// 网络相关(协议，本地地址，本地端口号，远地地址，远地端口号）
-#[derive(Debug, Eq, Hash, PartialEq, New, Set, Get, Clone)]
+#[derive(Debug, Eq, Hash, PartialEq, New, Clone)]
 pub struct Association {
     pub local_addr: SocketAddr,
     pub remote_addr: SocketAddr,
@@ -76,7 +80,7 @@ impl Zip {
     }
 
     pub fn is_shutdown_event(&self) -> bool {
-        if let Self::Event(Event { type_code: 0, .. }) = self {
+        if let Self::Event(Event { type_code: IoEventType::Close, .. }) = self {
             return true;
         }
         false
@@ -110,32 +114,20 @@ impl Zip {
     }
 }
 
-#[derive(Debug, New, Set, Get)]
+#[derive(Debug, New)]
 pub struct Package {
     pub association: Association,
     pub data: Bytes,
 }
 
-impl Package {
-    pub fn get_owned_data(self) -> Bytes {
-        self.data
-    }
-}
-
-#[derive(Debug, New, Set, Get)]
+#[derive(Debug, New)]
 pub struct Gate {
     //监听地址
-    local_addr: SocketAddr,
+    pub local_addr: SocketAddr,
     //从socket读取数据向程序发送
-    input: Sender<Zip>,
+    pub input: Sender<Zip>,
     //从程序中接收数据向socket写入
-    output: Receiver<Zip>,
-}
-
-impl Gate {
-    pub fn get_owned_output(self) -> Receiver<Zip> {
-        self.output
-    }
+    pub output: Receiver<Zip>,
 }
 
 #[derive(Debug)]

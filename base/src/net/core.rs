@@ -68,8 +68,8 @@ pub async fn accept(rx: oneshot::Receiver<GateListener>, tx: Sender<GateAccept>)
             match gate_listener {
                 GateListener::Tcp(gate, listener) => {
                     let sender = tx.clone();
-                    let local_addr = gate.get_local_addr().clone();
-                    let input = gate.get_input().clone();
+                    let local_addr = gate.local_addr;
+                    let input = gate.input;
                     tokio::spawn(async move {
                         while IS_RUNNING.load(Ordering::SeqCst) {
                             //给予每个对外发送数据tcp连接一个接收句柄，并将其对应的发送句柄保存起来
@@ -80,7 +80,7 @@ pub async fn accept(rx: oneshot::Receiver<GateListener>, tx: Sender<GateAccept>)
                     });
                     tokio::spawn(async move {
                         //接收对外输出信息，并根据Zip上的账单信息，发送到对应的TCP发送通道
-                        let mut receiver = gate.get_owned_output();
+                        let mut receiver = gate.output;
                         while let Some(zip) = receiver.recv().await {
                             if let Some(lone_output_tx) = TCP_HANDLE_MAP.get(&zip.get_association()) {
                                 let _ = lone_output_tx.send(zip).await.hand_log(|msg| error!("{msg}"));
@@ -93,8 +93,8 @@ pub async fn accept(rx: oneshot::Receiver<GateListener>, tx: Sender<GateAccept>)
                 }
                 GateListener::All((tcp_gate, tcp_listener), (udp_gate, udp_socket)) => {
                     let sender = tx.clone();
-                    let local_addr = tcp_gate.get_local_addr().clone();
-                    let input = tcp_gate.get_input().clone();
+                    let local_addr = tcp_gate.local_addr;
+                    let input = tcp_gate.input;
                     tokio::spawn(async move {
                         while IS_RUNNING.load(Ordering::SeqCst) {
                             //给予每个对外发送数据tcp连接一个接收句柄，并将其对应的发送句柄保存起来
@@ -105,7 +105,7 @@ pub async fn accept(rx: oneshot::Receiver<GateListener>, tx: Sender<GateAccept>)
                     });
                     tokio::spawn(async move {
                         //接收对外输出信息，并根据Zip上的账单信息，发送到对应的TCP发送通道
-                        let mut receiver = tcp_gate.get_owned_output();
+                        let mut receiver = tcp_gate.output;
                         while let Some(zip) = receiver.recv().await {
                             if let Some(lone_output_tx) = TCP_HANDLE_MAP.get(&zip.get_association()) {
                                 let _ = lone_output_tx.send(zip).await.hand_log(|msg| error!("{msg}"));
@@ -128,20 +128,20 @@ pub async fn rw(mut rx: Receiver<GateAccept>) {
         match gate_accept {
             GateAccept::Tcp(gate, remote_addr, tcp_stream) => {
                 let (read, write) = io::split(tcp_stream);
-                let local_addr = gate.get_local_addr().clone();
-                let sender = gate.get_input().clone();
+                let local_addr = gate.local_addr;
+                let sender = gate.input;
                 tokio::spawn(async move {
                     let _ = tcp::read(read, local_addr, remote_addr, sender).await;
                 });
-                let receiver = gate.get_owned_output();
+                let receiver = gate.output;
                 tokio::spawn(async move {
                     let _ = tcp::write(write, receiver).await;
                 });
             }
             GateAccept::Udp(gate, udp_socket) => {
-                let local_addr = gate.get_local_addr().clone();
-                let sender = gate.get_input().clone();
-                let receiver = gate.get_owned_output();
+                let local_addr = gate.local_addr;
+                let sender = gate.input;
+                let receiver = gate.output;
                 let aus = Arc::new(udp_socket);
                 let ausc = aus.clone();
                 //子任务读写循环跳出后，udp_socket生命周期自动drop，完成udp关闭释放

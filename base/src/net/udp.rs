@@ -9,14 +9,14 @@ use tokio::io;
 
 //监听，将socket句柄发送出去
 pub async fn listen(gate: Gate) -> GlobalResult<GateListener> {
-    let local_addr = gate.get_local_addr().clone();
+    let local_addr = gate.local_addr;
     let socket = UdpSocket::bind(local_addr).await.hand_log(|msg| error!("{msg}"))?;
     let gate_listener = GateListener::build_udp(gate, socket);
     debug!("开始监听 UDP 地址： {}", local_addr);
     Ok(gate_listener)
 }
 pub fn listen_by_std(gate: Gate,std_udp_socket:std::net::UdpSocket) -> GlobalResult<GateListener> {
-    debug!("tokio监听 UDP 地址： {}", gate.get_local_addr());
+    debug!("tokio监听 UDP 地址： {}", gate.local_addr);
     std_udp_socket.set_nonblocking(true).hand_log(|msg| error!("{msg}"))?;
     let socket = UdpSocket::from_std(std_udp_socket).hand_log(|msg| error!("{msg}"))?;
     let gate_listener = GateListener::build_udp(gate, socket);
@@ -71,10 +71,10 @@ pub async fn write(udp_socket: &UdpSocket, mut rx: Receiver<Zip>) {
         let _ = udp_socket.writable().await;
         match zip {
             Zip::Data(package) => {
-                let bytes = package.get_data();
-                let local_addr = package.get_association().get_local_addr();
-                let remote_addr = package.get_association().get_remote_addr();
-                match udp_socket.try_send_to(&*bytes, *package.get_association().get_remote_addr()) {
+                let bytes = package.data;
+                let local_addr = package.association.local_addr;
+                let remote_addr = package.association.remote_addr;
+                match udp_socket.try_send_to(&*bytes, package.association.remote_addr) {
                     Ok(len) => {
                         debug!("【UDP write success】 【Local_addr = {:?}】 【Remote_addr = {:?}】 【len = {}】",
                             local_addr,
