@@ -1,3 +1,4 @@
+use std::fmt::{Display, Formatter};
 use bytes::Bytes;
 use constructor::{New};
 use dashmap::DashMap;
@@ -46,6 +47,15 @@ pub enum Protocol {
     TCP,
     ALL,
 }
+impl Display for Protocol {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Protocol::UDP => write!(f, "UDP"),
+            Protocol::TCP => write!(f, "TCP"),
+            Protocol::ALL => write!(f, "ALL"),
+        }
+    }
+}
 
 impl Protocol {
     pub fn get_value(&self) -> &str {
@@ -63,6 +73,15 @@ pub struct Association {
     pub local_addr: SocketAddr,
     pub remote_addr: SocketAddr,
     pub protocol: Protocol,
+}
+impl Display for Association {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {}/{}",
+            self.protocol, self.local_addr, self.remote_addr
+        )
+    }
 }
 
 ///EVENT:
