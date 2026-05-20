@@ -144,7 +144,7 @@ where
     let socket = UdpSocket::from_std(udp).hand_log(|msg| debug!("{msg}"))?;
 
     tokio::spawn(async move {
-        let mut buf = BytesMut::with_capacity(2048);
+        let mut buf = BytesMut::with_capacity(4096);
         loop {
             select! {
                 Ok((n,addr)) = udp_socket_read_buf(&mut buf,&socket)=>{
