@@ -149,7 +149,7 @@ where
             select! {
                 Ok((n,addr)) = udp_socket_read_buf(&mut buf,&socket)=>{
                     if n!=0{
-                        let data = buf.split().freeze();
+                        let data = buf.split_to(n).freeze();
                         let _ = dispatcher.dispatch(data, addr, Protocol::UDP);
                     }
                 }
