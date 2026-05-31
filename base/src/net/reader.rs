@@ -1,5 +1,5 @@
 use crate::net::state::Protocol;
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::BytesMut;
 use exception::{GlobalResult, GlobalResultExt};
 use log::{debug, error, warn};
 use std::net::SocketAddr;
@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 pub trait PacketDispatcher: Send + Sync + 'static {
     fn dispatch(
         &self,
-        data: Bytes,
+        data: &[u8],
         remote_addr: SocketAddr,
         protocol: Protocol,
     ) -> GlobalResult<()>;
@@ -20,9 +20,12 @@ pub trait PacketDispatcher: Send + Sync + 'static {
 
 pub trait PacketSplitter: Send + 'static {
     fn feed<F>(&mut self, chunk: &mut BytesMut, f: F)-> GlobalResult<()>
-    where F: FnMut(Bytes) -> GlobalResult<()>;
+    where F: FnMut(&[u8]) -> GlobalResult<()>;
 }
 const MAX_BUF_SIZE: usize = 2 * 1024 * 1024;
+const TCP_READ_BUF_SIZE: usize = 64 * 1024;
+const TCP_MIN_READ_SPARE: usize = 4 * 1024;
+const UDP_RECV_BUF_SIZE: usize = 2 * 1024;
 pub fn reader<D, S>(
     tu: (Option<std::net::TcpListener>, Option<std::net::UdpSocket>),
     cancel: CancellationToken,
@@ -96,7 +99,7 @@ where
     D: PacketDispatcher,
     S: PacketSplitter,
 {
-    let mut buf = BytesMut::with_capacity(64 * 1024);
+    let mut buf = BytesMut::with_capacity(TCP_READ_BUF_SIZE);
     loop {
         select! {
             res = tcp_stream_read_buf(&mut buf,&mut stream) => {
@@ -123,10 +126,14 @@ where
     Ok(())
 }
 
-async fn tcp_stream_read_buf(buf: &mut BytesMut, stream: &mut TcpStream) -> std::io::Result<usize> {
-    if buf.remaining_mut() < 4096 {
-        buf.reserve(64 * 1024);
+fn ensure_spare_capacity(buf: &mut BytesMut, min_spare: usize, reserve_size: usize) {
+    if buf.capacity().saturating_sub(buf.len()) < min_spare {
+        buf.reserve(reserve_size);
     }
+}
+
+async fn tcp_stream_read_buf(buf: &mut BytesMut, stream: &mut TcpStream) -> std::io::Result<usize> {
+    ensure_spare_capacity(buf, TCP_MIN_READ_SPARE, TCP_READ_BUF_SIZE);
     //Tokio 的 read_buf 内部已经处理了 WouldBlock 并挂起任务
     stream.read_buf(buf).await
 }
@@ -144,13 +151,21 @@ where
     let socket = UdpSocket::from_std(udp).hand_log(|msg| debug!("{msg}"))?;
 
     tokio::spawn(async move {
-        let mut buf = BytesMut::with_capacity(4096);
+        let mut buf = vec![0u8; UDP_RECV_BUF_SIZE];
         loop {
             select! {
-                Ok((n,addr)) = udp_socket_read_buf(&mut buf,&socket)=>{
-                    if n!=0{
-                        let data = buf.split_to(n).freeze();
-                        let _ = dispatcher.dispatch(data, addr, Protocol::UDP);
+                res = udp_socket_read_buf(&mut buf,&socket)=>{
+                    match res {
+                        Ok((n,addr)) if n != 0 => {
+                            if let Err(err) = dispatcher.dispatch(&buf[..n], addr, Protocol::UDP) {
+                                debug!("udp dispatch {} failed: {}", addr, err);
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            debug!("udp read failed: {}", err);
+                            break;
+                        }
                     }
                 }
 
@@ -162,12 +177,11 @@ where
     Ok(())
 }
 async fn udp_socket_read_buf(
-    buf: &mut BytesMut,
+    buf: &mut [u8],
     socket: &UdpSocket,
 ) -> GlobalResult<(usize, SocketAddr)> {
-    buf.clear();
     socket
-        .recv_buf_from(buf)
+        .recv_from(buf)
         .await
         .hand_log(|msg| error!("read buf failed:{}", msg))
 }
