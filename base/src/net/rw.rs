@@ -10,6 +10,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::select;
+use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio_util::sync::CancellationToken;
@@ -161,7 +162,6 @@ macro_rules! inline_prefix {
     };
 }
 
-
 #[derive(Clone, Debug)]
 pub enum EncodedPacket {
     Single(Bytes),
@@ -214,10 +214,258 @@ impl PacketEncoder for U16BeLengthPrefixEncoder {
     }
 }
 
-#[derive(Clone)]
-struct TcpWriterHandle {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TcpWriteMode {
+    Queued { queue_size: usize },
+    Direct,
+}
+
+impl Default for TcpWriteMode {
+    fn default() -> Self {
+        Self::Queued {
+            queue_size: TCP_WRITE_QUEUE_SIZE,
+        }
+    }
+}
+
+impl TcpWriteMode {
+    fn queue_size(self) -> Option<usize> {
+        match self {
+            Self::Queued { queue_size } => Some(queue_size.max(1)),
+            Self::Direct => None,
+        }
+    }
+}
+
+pub struct QueuedTcpSink<E = RawPacketEncoder>
+where
+    E: PacketEncoder,
+{
+    remote_addr: SocketAddr,
     sender: mpsc::Sender<EncodedPacket>,
+    encoder: Arc<E>,
     cancel: CancellationToken,
+}
+
+impl<E> Clone for QueuedTcpSink<E>
+where
+    E: PacketEncoder,
+{
+    fn clone(&self) -> Self {
+        Self {
+            remote_addr: self.remote_addr,
+            sender: self.sender.clone(),
+            encoder: self.encoder.clone(),
+            cancel: self.cancel.clone(),
+        }
+    }
+}
+
+impl<E> QueuedTcpSink<E>
+where
+    E: PacketEncoder,
+{
+    fn new(
+        remote_addr: SocketAddr,
+        sender: mpsc::Sender<EncodedPacket>,
+        encoder: Arc<E>,
+        cancel: CancellationToken,
+    ) -> Self {
+        Self {
+            remote_addr,
+            sender,
+            encoder,
+            cancel,
+        }
+    }
+
+    pub fn remote_addr(&self) -> SocketAddr {
+        self.remote_addr
+    }
+
+    pub fn close(&self) {
+        self.cancel.cancel();
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.cancel.is_cancelled() || self.sender.is_closed()
+    }
+
+    pub async fn write(&self, data: Bytes) -> GlobalResult<()> {
+        if self.cancel.is_cancelled() {
+            return Err(GlobalError::new_sys_error("tcp sink is closed", |msg| {
+                error!("{msg}: remote_addr={}", self.remote_addr)
+            }));
+        }
+        let packet = self.encoder.encode_tcp(data)?;
+        self.sender.send(packet).await.map_err(|_| {
+            GlobalError::new_sys_error("tcp write channel closed", |msg| {
+                error!("{msg}: remote_addr={}", self.remote_addr)
+            })
+        })
+    }
+
+    pub fn try_write(&self, data: Bytes) -> GlobalResult<()> {
+        if self.cancel.is_cancelled() {
+            return Err(GlobalError::new_sys_error("tcp sink is closed", |msg| {
+                error!("{msg}: remote_addr={}", self.remote_addr)
+            }));
+        }
+        let packet = self.encoder.encode_tcp(data)?;
+        match self.sender.try_send(packet) {
+            Ok(_) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(GlobalError::new_sys_error(
+                "tcp write channel is full",
+                |msg| error!("{msg}: remote_addr={}", self.remote_addr),
+            )),
+            Err(TrySendError::Closed(_)) => Err(GlobalError::new_sys_error(
+                "tcp write channel closed",
+                |msg| error!("{msg}: remote_addr={}", self.remote_addr),
+            )),
+        }
+    }
+}
+
+pub struct DirectTcpSink<E = RawPacketEncoder>
+where
+    E: PacketEncoder,
+{
+    remote_addr: SocketAddr,
+    stream: Arc<Mutex<OwnedWriteHalf>>,
+    encoder: Arc<E>,
+    cancel: CancellationToken,
+}
+
+impl<E> Clone for DirectTcpSink<E>
+where
+    E: PacketEncoder,
+{
+    fn clone(&self) -> Self {
+        Self {
+            remote_addr: self.remote_addr,
+            stream: self.stream.clone(),
+            encoder: self.encoder.clone(),
+            cancel: self.cancel.clone(),
+        }
+    }
+}
+
+impl<E> DirectTcpSink<E>
+where
+    E: PacketEncoder,
+{
+    fn new(
+        remote_addr: SocketAddr,
+        stream: OwnedWriteHalf,
+        encoder: Arc<E>,
+        cancel: CancellationToken,
+    ) -> Self {
+        Self {
+            remote_addr,
+            stream: Arc::new(Mutex::new(stream)),
+            encoder,
+            cancel,
+        }
+    }
+
+    pub fn remote_addr(&self) -> SocketAddr {
+        self.remote_addr
+    }
+
+    pub fn close(&self) {
+        self.cancel.cancel();
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+
+    pub async fn write(&self, data: Bytes) -> GlobalResult<()> {
+        if self.cancel.is_cancelled() {
+            return Err(GlobalError::new_sys_error("tcp sink is closed", |msg| {
+                error!("{msg}: remote_addr={}", self.remote_addr)
+            }));
+        }
+        let packet = self.encoder.encode_tcp(data)?;
+        let mut stream = self.stream.lock().await;
+        if self.cancel.is_cancelled() {
+            return Err(GlobalError::new_sys_error("tcp sink is closed", |msg| {
+                error!("{msg}: remote_addr={}", self.remote_addr)
+            }));
+        }
+        write_encoded_packet(&mut *stream, packet)
+            .await
+            .hand_log(|msg| error!("{msg}: remote_addr={}", self.remote_addr))
+    }
+
+    pub async fn shutdown(&self) -> GlobalResult<()> {
+        self.cancel.cancel();
+        let mut stream = self.stream.lock().await;
+        stream
+            .shutdown()
+            .await
+            .hand_log(|msg| error!("{msg}: remote_addr={}", self.remote_addr))
+    }
+}
+
+pub enum TcpPacketSink<E = RawPacketEncoder>
+where
+    E: PacketEncoder,
+{
+    Queued(QueuedTcpSink<E>),
+    Direct(DirectTcpSink<E>),
+}
+
+impl<E> Clone for TcpPacketSink<E>
+where
+    E: PacketEncoder,
+{
+    fn clone(&self) -> Self {
+        match self {
+            Self::Queued(sink) => Self::Queued(sink.clone()),
+            Self::Direct(sink) => Self::Direct(sink.clone()),
+        }
+    }
+}
+
+impl<E> TcpPacketSink<E>
+where
+    E: PacketEncoder,
+{
+    pub fn remote_addr(&self) -> SocketAddr {
+        match self {
+            Self::Queued(sink) => sink.remote_addr(),
+            Self::Direct(sink) => sink.remote_addr(),
+        }
+    }
+
+    pub fn is_direct(&self) -> bool {
+        matches!(self, Self::Direct(_))
+    }
+
+    pub fn close(&self) {
+        match self {
+            Self::Queued(sink) => sink.close(),
+            Self::Direct(sink) => sink.close(),
+        }
+    }
+
+    pub async fn write(&self, data: Bytes) -> GlobalResult<()> {
+        match self {
+            Self::Queued(sink) => sink.write(data).await,
+            Self::Direct(sink) => sink.write(data).await,
+        }
+    }
+
+    pub fn try_write(&self, data: Bytes) -> GlobalResult<()> {
+        match self {
+            Self::Queued(sink) => sink.try_write(data),
+            Self::Direct(sink) => Err(GlobalError::new_sys_error(
+                "direct tcp sink requires async write",
+                |msg| error!("{msg}: remote_addr={}", sink.remote_addr()),
+            )),
+        }
+    }
 }
 
 pub struct PacketWriter<E = RawPacketEncoder>
@@ -225,9 +473,10 @@ where
     E: PacketEncoder,
 {
     udp_socket: Option<Arc<UdpSocket>>,
-    tcp_writers: Arc<DashMap<SocketAddr, TcpWriterHandle>>,
+    tcp_writers: Arc<DashMap<SocketAddr, TcpPacketSink<E>>>,
     tcp_writer_addrs_by_ip: Arc<DashMap<IpAddr, SocketAddr>>,
     encoder: Arc<E>,
+    tcp_write_mode: TcpWriteMode,
 }
 
 impl<E> Clone for PacketWriter<E>
@@ -240,6 +489,7 @@ where
             tcp_writers: self.tcp_writers.clone(),
             tcp_writer_addrs_by_ip: self.tcp_writer_addrs_by_ip.clone(),
             encoder: self.encoder.clone(),
+            tcp_write_mode: self.tcp_write_mode,
         }
     }
 }
@@ -248,12 +498,17 @@ impl<E> PacketWriter<E>
 where
     E: PacketEncoder,
 {
-    fn new(udp_socket: Option<Arc<UdpSocket>>, encoder: Arc<E>) -> Self {
+    fn new(
+        udp_socket: Option<Arc<UdpSocket>>,
+        encoder: Arc<E>,
+        tcp_write_mode: TcpWriteMode,
+    ) -> Self {
         Self {
             udp_socket,
             tcp_writers: Arc::new(DashMap::new()),
             tcp_writer_addrs_by_ip: Arc::new(DashMap::new()),
             encoder,
+            tcp_write_mode,
         }
     }
 
@@ -275,24 +530,7 @@ where
                     .hand_log(|msg| error!("{msg}: remote_addr={remote_addr}"))?;
                 Ok(())
             }
-            Protocol::TCP => {
-                let packet = self.encoder.encode_tcp(data)?;
-                let sender = self
-                    .tcp_writers
-                    .get(&remote_addr)
-                    .map(|handle| handle.value().sender.clone())
-                    .ok_or_else(|| {
-                        GlobalError::new_sys_error("tcp writer is not available", |msg| {
-                            error!("{msg}: remote_addr={remote_addr}")
-                        })
-                    })?;
-                sender.send(packet).await.map_err(|_| {
-                    GlobalError::new_sys_error("tcp write channel closed", |msg| {
-                        error!("{msg}: remote_addr={remote_addr}")
-                    })
-                })?;
-                Ok(())
-            }
+            Protocol::TCP => self.tcp_sink_or_err(remote_addr)?.write(data).await,
             Protocol::ALL => Err(GlobalError::new_sys_error(
                 "protocol ALL cannot be used to write a packet",
                 |msg| error!("{msg}"),
@@ -329,31 +567,14 @@ where
     }
 
     pub async fn write_tcp_to_ip(&self, data: Bytes, remote_ip: IpAddr) -> GlobalResult<()> {
-        let packet = self.encoder.encode_tcp(data)?;
-        let remote_addr = self
-            .tcp_writer_addrs_by_ip
-            .get(&remote_ip)
-            .map(|item| *item.value())
+        self.tcp_sink_by_ip(remote_ip)
             .ok_or_else(|| {
                 GlobalError::new_sys_error("tcp writer is not available", |msg| {
                     error!("{msg}: remote_ip={remote_ip}")
                 })
-            })?;
-        let sender = self
-            .tcp_writers
-            .get(&remote_addr)
-            .map(|handle| handle.value().sender.clone())
-            .ok_or_else(|| {
-                GlobalError::new_sys_error("tcp writer is not available", |msg| {
-                    error!("{msg}: remote_addr={remote_addr}")
-                })
-            })?;
-        sender.send(packet).await.map_err(|_| {
-            GlobalError::new_sys_error("tcp write channel closed", |msg| {
-                error!("{msg}: remote_ip={remote_ip}")
-            })
-        })?;
-        Ok(())
+            })?
+            .write(data)
+            .await
     }
 
     pub fn try_write_to(
@@ -373,34 +594,38 @@ where
                     .hand_log(|msg| error!("{msg}: remote_addr={remote_addr}"))?;
                 Ok(())
             }
-            Protocol::TCP => {
-                let packet = self.encoder.encode_tcp(data)?;
-                let sender = self
-                    .tcp_writers
-                    .get(&remote_addr)
-                    .map(|handle| handle.value().sender.clone())
-                    .ok_or_else(|| {
-                        GlobalError::new_sys_error("tcp writer is not available", |msg| {
-                            error!("{msg}: remote_addr={remote_addr}")
-                        })
-                    })?;
-                match sender.try_send(packet) {
-                    Ok(_) => Ok(()),
-                    Err(TrySendError::Full(_)) => Err(GlobalError::new_sys_error(
-                        "tcp write channel is full",
-                        |msg| error!("{msg}: remote_addr={remote_addr}"),
-                    )),
-                    Err(TrySendError::Closed(_)) => Err(GlobalError::new_sys_error(
-                        "tcp write channel closed",
-                        |msg| error!("{msg}: remote_addr={remote_addr}"),
-                    )),
-                }
-            }
+            Protocol::TCP => self.tcp_sink_or_err(remote_addr)?.try_write(data),
             Protocol::ALL => Err(GlobalError::new_sys_error(
                 "protocol ALL cannot be used to write a packet",
                 |msg| error!("{msg}"),
             )),
         }
+    }
+
+    pub fn tcp_write_mode(&self) -> TcpWriteMode {
+        self.tcp_write_mode
+    }
+
+    pub fn tcp_sink(&self, remote_addr: &SocketAddr) -> Option<TcpPacketSink<E>> {
+        self.tcp_writers
+            .get(remote_addr)
+            .map(|item| item.value().clone())
+    }
+
+    pub fn tcp_sink_by_ip(&self, remote_ip: IpAddr) -> Option<TcpPacketSink<E>> {
+        let remote_addr = self
+            .tcp_writer_addrs_by_ip
+            .get(&remote_ip)
+            .map(|item| *item.value())?;
+        self.tcp_sink(&remote_addr)
+    }
+
+    fn tcp_sink_or_err(&self, remote_addr: SocketAddr) -> GlobalResult<TcpPacketSink<E>> {
+        self.tcp_sink(&remote_addr).ok_or_else(|| {
+            GlobalError::new_sys_error("tcp writer is not available", |msg| {
+                error!("{msg}: remote_addr={remote_addr}")
+            })
+        })
     }
 
     pub fn insert_tcp_writer(
@@ -409,10 +634,34 @@ where
         sender: mpsc::Sender<EncodedPacket>,
         cancel: CancellationToken,
     ) {
+        let sink = TcpPacketSink::Queued(QueuedTcpSink::new(
+            remote_addr,
+            sender,
+            self.encoder.clone(),
+            cancel,
+        ));
+        self.insert_tcp_sink(remote_addr, sink);
+    }
+
+    pub fn insert_direct_tcp_writer(
+        &self,
+        remote_addr: SocketAddr,
+        stream: OwnedWriteHalf,
+        cancel: CancellationToken,
+    ) {
+        let sink = TcpPacketSink::Direct(DirectTcpSink::new(
+            remote_addr,
+            stream,
+            self.encoder.clone(),
+            cancel,
+        ));
+        self.insert_tcp_sink(remote_addr, sink);
+    }
+
+    fn insert_tcp_sink(&self, remote_addr: SocketAddr, sink: TcpPacketSink<E>) {
         self.tcp_writer_addrs_by_ip
             .insert(remote_addr.ip(), remote_addr);
-        self.tcp_writers
-            .insert(remote_addr, TcpWriterHandle { sender, cancel });
+        self.tcp_writers.insert(remote_addr, sink);
     }
 
     pub fn remove_tcp_writer(&self, remote_addr: &SocketAddr) {
@@ -425,7 +674,7 @@ where
             {
                 self.tcp_writer_addrs_by_ip.remove(&remote_ip);
             }
-            handle.cancel.cancel();
+            handle.close();
         }
     }
 
@@ -485,12 +734,41 @@ where
     S: PacketSplitter + Default,
     E: PacketEncoder,
 {
+    rw_with_tcp_write_mode::<D, S, E>(tu, cancel, dispatcher, encoder, TcpWriteMode::default())
+}
+
+pub fn direct_rw<D, S, E>(
+    tu: (Option<std::net::TcpListener>, Option<std::net::UdpSocket>),
+    cancel: CancellationToken,
+    dispatcher: Arc<D>,
+    encoder: Arc<E>,
+) -> GlobalResult<PacketWriter<E>>
+where
+    D: PacketDispatcher,
+    S: PacketSplitter + Default,
+    E: PacketEncoder,
+{
+    rw_with_tcp_write_mode::<D, S, E>(tu, cancel, dispatcher, encoder, TcpWriteMode::Direct)
+}
+
+pub fn rw_with_tcp_write_mode<D, S, E>(
+    tu: (Option<std::net::TcpListener>, Option<std::net::UdpSocket>),
+    cancel: CancellationToken,
+    dispatcher: Arc<D>,
+    encoder: Arc<E>,
+    tcp_write_mode: TcpWriteMode,
+) -> GlobalResult<PacketWriter<E>>
+where
+    D: PacketDispatcher,
+    S: PacketSplitter + Default,
+    E: PacketEncoder,
+{
     let (tcp, udp) = tu;
     let udp_socket = match udp {
         Some(udp) => Some(into_tokio_udp_socket(udp)?),
         None => None,
     };
-    let writer = PacketWriter::new(udp_socket.clone(), encoder);
+    let writer = PacketWriter::new(udp_socket.clone(), encoder, tcp_write_mode);
     if let Some(tcp) = tcp {
         spawn_tcp_rw::<D, S, E>(tcp, cancel.clone(), dispatcher.clone(), writer.clone())?;
     }
@@ -627,24 +905,42 @@ where
                             let conn_cancel = cancel.child_token();
                             let writer = writer.clone();
                             let (read_half, write_half) = stream.into_split();
-                            let (tx, rx) = mpsc::channel(TCP_WRITE_QUEUE_SIZE);
-                            writer.insert_tcp_writer(remote_addr, tx, conn_cancel.clone());
-
-                            tokio::spawn(handle_tcp_read_owned_half::<D, S, E>(
-                                read_half,
-                                remote_addr,
-                                conn_cancel.clone(),
-                                dispatcher,
-                                S::default(),
-                                writer.clone(),
-                            ));
-                            tokio::spawn(handle_tcp_write::<E>(
-                                write_half,
-                                remote_addr,
-                                conn_cancel,
-                                rx,
-                                writer,
-                            ));
+                            match writer.tcp_write_mode().queue_size() {
+                                Some(queue_size) => {
+                                    let (tx, rx) = mpsc::channel(queue_size);
+                                    writer.insert_tcp_writer(remote_addr, tx, conn_cancel.clone());
+                                    tokio::spawn(handle_tcp_read_owned_half::<D, S, E>(
+                                        read_half,
+                                        remote_addr,
+                                        conn_cancel.clone(),
+                                        dispatcher,
+                                        S::default(),
+                                        writer.clone(),
+                                    ));
+                                    tokio::spawn(handle_tcp_write::<E>(
+                                        write_half,
+                                        remote_addr,
+                                        conn_cancel,
+                                        rx,
+                                        writer,
+                                    ));
+                                }
+                                None => {
+                                    writer.insert_direct_tcp_writer(
+                                        remote_addr,
+                                        write_half,
+                                        conn_cancel.clone(),
+                                    );
+                                    tokio::spawn(handle_tcp_read_owned_half::<D, S, E>(
+                                        read_half,
+                                        remote_addr,
+                                        conn_cancel,
+                                        dispatcher,
+                                        S::default(),
+                                        writer,
+                                    ));
+                                }
+                            }
                         }
                         Err(e) => {
                             error!("accept failed: {e}");

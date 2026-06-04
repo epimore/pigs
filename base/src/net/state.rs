@@ -1,15 +1,8 @@
-use std::fmt::{Display, Formatter};
 use bytes::Bytes;
-use constructor::{New};
-use dashmap::DashMap;
-use once_cell::sync::Lazy;
+use constructor::New;
+use std::fmt::{Display, Formatter};
 use std::net::SocketAddr;
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::mpsc::{Receiver, Sender};
 
-//TCP连接有状态，需要持有每个连接的句柄
-pub static TCP_HANDLE_MAP: Lazy<DashMap<Association, Sender<Zip>>> = Lazy::new(|| DashMap::new());
-pub const SOCKET_BUFFER_SIZE: usize = 4096;
 pub const CHANNEL_BUFFER_SIZE: usize = 10000;
 pub const UDP: &str = "UDP";
 pub const TCP: &str = "TCP";
@@ -20,7 +13,7 @@ pub enum IoEventType {
     Close = 0,
 }
 
-///type_code = 0 为连接断开
+/// type_code = 0 means connection closed.
 #[derive(Debug, New)]
 pub struct Event {
     pub association: Association,
@@ -47,6 +40,7 @@ pub enum Protocol {
     TCP,
     ALL,
 }
+
 impl Display for Protocol {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -67,13 +61,13 @@ impl Protocol {
     }
 }
 
-/// 网络相关(协议，本地地址，本地端口号，远地地址，远地端口号）
 #[derive(Debug, Eq, Hash, PartialEq, New, Clone)]
 pub struct Association {
     pub local_addr: SocketAddr,
     pub remote_addr: SocketAddr,
     pub protocol: Protocol,
 }
+
 impl Display for Association {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -84,12 +78,9 @@ impl Display for Association {
     }
 }
 
-///EVENT:
-/// 0-TCP链接断开；input->对端断开连接；output->主动断开连接
 #[derive(Debug)]
 pub enum Zip {
     Data(Package),
-    //网络事件
     Event(Event),
 }
 
@@ -99,11 +90,15 @@ impl Zip {
     }
 
     pub fn is_shutdown_event(&self) -> bool {
-        if let Self::Event(Event { type_code: IoEventType::Close, .. }) = self {
-            return true;
-        }
-        false
+        matches!(
+            self,
+            Self::Event(Event {
+                type_code: IoEventType::Close,
+                ..
+            })
+        )
     }
+
     pub fn build_data(package: Package) -> Self {
         Self::Data(package)
     }
@@ -113,19 +108,19 @@ impl Zip {
     }
 
     pub fn get_association(&self) -> Association {
-        match &self {
-            Zip::Data(Package { association, .. }) => association.clone(),
-            Zip::Event(Event { association, .. }) => association.clone(),
+        match self {
+            Self::Data(Package { association, .. }) => association.clone(),
+            Self::Event(Event { association, .. }) => association.clone(),
         }
     }
 
     pub fn get_association_protocol(&self) -> &Protocol {
         match self {
-            Zip::Data(Package {
+            Self::Data(Package {
                 association: Association { protocol, .. },
                 ..
             }) => protocol,
-            Zip::Event(Event {
+            Self::Event(Event {
                 association: Association { protocol, .. },
                 ..
             }) => protocol,
@@ -137,54 +132,4 @@ impl Zip {
 pub struct Package {
     pub association: Association,
     pub data: Bytes,
-}
-
-#[derive(Debug, New)]
-pub struct Gate {
-    //监听地址
-    pub local_addr: SocketAddr,
-    //从socket读取数据向程序发送
-    pub input: Sender<Zip>,
-    //从程序中接收数据向socket写入
-    pub output: Receiver<Zip>,
-}
-
-#[derive(Debug)]
-pub enum GateListener {
-    Tcp(Gate, TcpListener),
-    Udp(Gate, UdpSocket),
-    All((Gate, TcpListener), (Gate, UdpSocket)),
-}
-
-impl GateListener {
-    pub fn build_tcp(gate: Gate, tcp_listener: TcpListener) -> Self {
-        Self::Tcp(gate, tcp_listener)
-    }
-    pub fn build_udp(gate: Gate, udp_socket: UdpSocket) -> Self {
-        Self::Udp(gate, udp_socket)
-    }
-    pub fn build_all(tg: GateListener, ug: GateListener) -> Self {
-        match (tg, ug) {
-            (GateListener::Tcp(t_gate, tcp_listener), GateListener::Udp(u_gate, udp_socket)) => {
-                Self::All((t_gate, tcp_listener), (u_gate, udp_socket))
-            }
-            _ => panic!("build_all requires a Tcp and Udp listener"),
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum GateAccept {
-    //SocketAddr:remote_addr
-    Tcp(Gate, SocketAddr, TcpStream),
-    Udp(Gate, UdpSocket),
-}
-
-impl GateAccept {
-    pub fn accept_tcp(gate: Gate, remote_addr: SocketAddr, tcp_stream: TcpStream) -> Self {
-        Self::Tcp(gate, remote_addr, tcp_stream)
-    }
-    pub fn accept_udp(gate: Gate, udp_socket: UdpSocket) -> Self {
-        Self::Udp(gate, udp_socket)
-    }
 }
