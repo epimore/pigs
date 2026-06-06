@@ -2,13 +2,13 @@ pub mod signal;
 #[cfg(unix)]
 mod unix;
 
+use cfg_lib::CliBasic;
 use exception::GlobalResult;
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
 use std::{env, fs};
-use cfg_lib::CliBasic;
 
 //todo 优化，运行前检查是否已有进程运行：当前即使未再次运行成功也会重写meta数据
 pub trait Daemon<T> {
@@ -132,7 +132,7 @@ where
                 eprintln!("Not running daemon mode");
             }
         }
-        Some(("status",_)) =>{
+        Some(("status", _)) => {
             if cfg!(target_os = "linux") || cfg!(target_os = "macos") {
                 #[cfg(unix)]
                 {

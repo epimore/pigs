@@ -1,12 +1,15 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-use std::process;
 use base64::Engine;
+use std::process;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const NONCE: &str = "Gmv123...";
 
 /// 生成token（base64编码返回）
 pub fn encode_token(id: &str, sec: &str, noc: &str) -> String {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     let pid = process::id();
     let raw = format!("{id}.{sec}.{now}.{pid}");
     let sig = simple_hash(&(raw.clone() + noc));
@@ -30,7 +33,9 @@ pub fn verify_token(token: &str, key: &str) -> bool {
         Err(_) => return false,
     };
     let parts: Vec<&str> = raw.rsplitn(2, '.').collect();
-    if parts.len() != 2 { return false; }
+    if parts.len() != 2 {
+        return false;
+    }
     let sig = parts[0];
     let raw_str = &raw[..raw.len() - sig.len() - 1];
     let expected = format!("{:016x}", simple_hash(&(raw_str.to_string() + key)));

@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::Read;
 use std::sync::{Arc, Mutex};
 
-use crate::{CliBasic};
+use crate::CliBasic;
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use once_cell::sync::{Lazy, OnceCell};
 

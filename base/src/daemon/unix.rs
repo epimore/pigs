@@ -1,11 +1,11 @@
 use crate::daemon::Daemon;
+use chrono::{DateTime, NaiveDateTime};
 use daemonize::{Daemonize, Outcome};
 use std::fs::File;
 use std::io::Read;
 use std::process::{exit, Command};
 use std::time::{Duration, Instant};
 use std::{env, thread};
-use chrono::{DateTime, NaiveDateTime};
 
 // ----------------------------
 // Helper: 读取 PID 文件
@@ -66,7 +66,9 @@ pub(super) fn status_service() {
                             let raw = raw.trim();
                             if !raw.is_empty() {
                                 // 尝试解析并格式化
-                                if let Ok(friendly_time) = format_start_time_friendly(&raw.replace("  ", " ")) {
+                                if let Ok(friendly_time) =
+                                    format_start_time_friendly(&raw.replace("  ", " "))
+                                {
                                     println!("Started at: {}", friendly_time);
                                     printed_start_time = true;
                                 }
@@ -103,7 +105,10 @@ pub(super) fn status_service() {
                     }
                 }
             } else {
-                println!("Service PID file exists (PID {}) but process is not running", pid);
+                println!(
+                    "Service PID file exists (PID {}) but process is not running",
+                    pid
+                );
                 println!("This may indicate a stale PID file. You can run 'stop' to clean it up.");
             }
         }
@@ -160,7 +165,10 @@ where
             eprintln!("Service already running with PID {}", pid);
             exit(1);
         } else {
-            eprintln!("Stale PID file found (PID {} not running). Removing...", pid);
+            eprintln!(
+                "Stale PID file found (PID {} not running). Removing...",
+                pid
+            );
             remove_pid_file();
         }
     }
@@ -179,18 +187,16 @@ where
         .privileged_action(move || D::init_privilege());
 
     match daemonize.execute() {
-        Outcome::Child(Ok(child)) => {
-            match child.privileged_action_result {
-                Ok((d, t)) => {
-                    if let Err(e) = d.run_app(t) {
-                        eprintln!("App runtime error: {}", e);
-                    }
-                }
-                Err(err) => {
-                    eprintln!("Privileged action failed: {}", err);
+        Outcome::Child(Ok(child)) => match child.privileged_action_result {
+            Ok((d, t)) => {
+                if let Err(e) = d.run_app(t) {
+                    eprintln!("App runtime error: {}", e);
                 }
             }
-        }
+            Err(err) => {
+                eprintln!("Privileged action failed: {}", err);
+            }
+        },
         Outcome::Child(Err(err)) => {
             eprintln!("Daemonize child error: {}", err);
         }

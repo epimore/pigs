@@ -5,9 +5,9 @@ use fern::colors::{Color, ColoredLevelConfig};
 use log::{error, LevelFilter};
 use serde::{Deserialize, Deserializer};
 
-use cfg_lib::{conf};
-use exception::{GlobalResult, GlobalResultExt};
 use crate::serde_default;
+use cfg_lib::conf;
+use exception::{GlobalResult, GlobalResultExt};
 
 /// 通过配置文件控制日志格式化输出
 /// # Examples
@@ -50,7 +50,6 @@ pub struct Specify {
     file_name_prefix: Option<String>,
 }
 
-
 impl Logger {
     pub fn init() -> GlobalResult<()> {
         let mut log: Logger = Logger::conf();
@@ -74,19 +73,18 @@ impl Logger {
             .warn(Color::Yellow)
             .error(Color::Red);
 
-        let formatter = move |out: fern::FormatCallback,
-                              msg: &std::fmt::Arguments,
-                              record: &log::Record| {
-            out.finish(format_args!(
-                "[{}] [{}] [{}] {}:{} >> {}",
-                Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
-                colors.color(record.level()),
-                record.target(),
-                record.file().unwrap_or("unknown"),
-                record.line().unwrap_or(0),
-                msg,
-            ))
-        };
+        let formatter =
+            move |out: fern::FormatCallback, msg: &std::fmt::Arguments, record: &log::Record| {
+                out.finish(format_args!(
+                    "[{}] [{}] [{}] {}:{} >> {}",
+                    Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
+                    colors.color(record.level()),
+                    record.target(),
+                    record.file().unwrap_or("unknown"),
+                    record.line().unwrap_or(0),
+                    msg,
+                ))
+            };
 
         // 记录所有独立输出的 target，用于主日志排除
         let mut exclude_targets: Vec<String> = Vec::new();
@@ -94,7 +92,7 @@ impl Logger {
         // 主日志（最后再 chain）
         let main_logger = fern::Dispatch::new()
             .format(formatter.clone())
-            .level(level_filter(&log.level))   // 默认等级
+            .level(level_filter(&log.level)) // 默认等级
             .chain(std::io::stdout())
             .chain(fern::DateBased::new(
                 &store_path,
@@ -130,7 +128,6 @@ impl Logger {
                         ));
 
                     dispatch = dispatch.chain(file_logger);
-
                 } else {
                     // case ②：使用主日志，提高等级
                     for t in targets {
@@ -141,9 +138,8 @@ impl Logger {
         }
 
         // 主日志排除“独立文件输出”的 targets
-        let main_logger = main_logger.filter(move |meta| {
-            !match_target(meta.target(), &exclude_targets)
-        });
+        let main_logger =
+            main_logger.filter(move |meta| !match_target(meta.target(), &exclude_targets));
 
         dispatch = dispatch.chain(main_logger);
 
@@ -166,7 +162,6 @@ fn match_target(target: &str, rules: &[String]) -> bool {
         }
     })
 }
-
 
 pub fn level_filter(level: &str) -> LevelFilter {
     match level.trim().to_uppercase().as_str() {

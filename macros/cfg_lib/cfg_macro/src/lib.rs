@@ -188,7 +188,10 @@ fn build_default_data_type(ast: &DeriveInput) -> proc_macro2::TokenStream {
     };
 
     let proxy_name = format_ident!("__CfgMacroDefaultProxyFor{}", ast.ident);
-    let struct_serde_attrs = ast.attrs.iter().filter(|attr| attr.path().is_ident("serde"));
+    let struct_serde_attrs = ast
+        .attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("serde"));
 
     let proxy_fields = fields.iter().map(|field| {
         let field_name = field.ident.as_ref().expect("named field");

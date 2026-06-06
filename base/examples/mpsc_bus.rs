@@ -1,7 +1,7 @@
-use std::{time::Duration};
-use tokio::time::sleep;
 use base::bus::mpsc::TypedMessageBus;
 use exception::typed::common::MessageBusError;
+use std::time::Duration;
+use tokio::time::sleep;
 
 #[tokio::main]
 async fn main() {
@@ -20,21 +20,35 @@ async fn main() {
         }
     });
     tokio::spawn(async move {
-        match u8_receiver.recv_with_timeout(Duration::from_secs(1)).await  {
-            Ok(msg) => {println!("[u8] received: {:?}", msg);}
-            Err(err) => { println!("[u8] receive error: {:?}", err);}
+        match u8_receiver.recv_with_timeout(Duration::from_secs(1)).await {
+            Ok(msg) => {
+                println!("[u8] received: {:?}", msg);
+            }
+            Err(err) => {
+                println!("[u8] receive error: {:?}", err);
+            }
         }
     });
     assert_eq!(bus.publish(42_u32).await.is_err(), true);
-    bus.publish("aaaa".to_string()).await.expect("TODO: panic message");
-    bus.publish(User { name: "Alice".into(), age: 30, sex: false }).await.expect("TODO: panic message");
+    bus.publish("aaaa".to_string())
+        .await
+        .expect("TODO: panic message");
+    bus.publish(User {
+        name: "Alice".into(),
+        age: 30,
+        sex: false,
+    })
+    .await
+    .expect("TODO: panic message");
 
     sleep(Duration::from_secs(2)).await;
     match bus.publish(42_u8).await {
         Ok(_) => {}
-        Err(err) => { println!("[u8] receive error: {:?}", err);}
+        Err(err) => {
+            println!("[u8] receive error: {:?}", err);
+        }
     }
-    
+
     assert_eq!(bus.publish(12i8).await.is_err(), true);
     sleep(Duration::from_secs(2)).await;
     let mut i8_receiver = bus.sub_type_channel::<i8>().unwrap();
@@ -43,7 +57,6 @@ async fn main() {
     }
     println!("Done.");
 }
-
 
 #[derive(Debug, Default, Clone)]
 struct User {

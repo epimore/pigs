@@ -10,9 +10,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::select;
-use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 pub trait PacketDispatcher: Send + Sync + 'static {
@@ -393,9 +393,13 @@ where
                 error!("{msg}: remote_addr={}", self.remote_addr)
             }));
         }
-        write_encoded_packet(&mut *stream, packet)
+        let result = write_encoded_packet(&mut *stream, packet)
             .await
-            .hand_log(|msg| error!("{msg}: remote_addr={}", self.remote_addr))
+            .hand_log(|msg| error!("{msg}: remote_addr={}", self.remote_addr));
+        if result.is_err() {
+            self.cancel.cancel();
+        }
+        result
     }
 
     pub async fn shutdown(&self) -> GlobalResult<()> {
@@ -1099,6 +1103,7 @@ async fn handle_tcp_write<E>(
             _ = cancel.cancelled() => break,
         }
     }
+    cancel.cancel();
     writer.remove_tcp_writer(&remote_addr);
     let _ = stream.shutdown().await;
 }
@@ -1268,6 +1273,12 @@ async fn udp_socket_read_owned_buf(
 
 #[cfg(test)]
 mod tests {
+    use super::{handle_tcp_write, PacketWriter, RawPacketEncoder, TcpWriteMode};
+    use crate::tokio;
+    use crate::tokio::net::{TcpListener, TcpStream};
+    use crate::tokio::sync::mpsc;
+    use crate::tokio_util::sync::CancellationToken;
+    use std::sync::Arc;
 
     #[test]
     fn inline_prefix_macro_uses_numeric_width_and_endian() {
@@ -1289,5 +1300,24 @@ mod tests {
             &[0x01, 0x02]
         );
         assert_eq!(crate::inline_prefix!(be, 0x0102030405060708u64).len(), 8);
+    }
+
+    #[tokio::test]
+    async fn tcp_write_task_exit_cancels_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connect = tokio::spawn(TcpStream::connect(addr));
+        let (server, remote_addr) = listener.accept().await.unwrap();
+        let client = connect.await.unwrap().unwrap();
+        let (_read_half, write_half) = server.into_split();
+        let cancel = CancellationToken::new();
+        let writer = PacketWriter::new(None, Arc::new(RawPacketEncoder), TcpWriteMode::default());
+        let (tx, rx) = mpsc::channel(1);
+        drop(tx);
+
+        handle_tcp_write(write_half, remote_addr, cancel.clone(), rx, writer).await;
+
+        assert!(cancel.is_cancelled());
+        drop(client);
     }
 }

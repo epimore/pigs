@@ -1,8 +1,8 @@
-use std::borrow::Cow;
 use dashmap::DashMap;
+use exception::{BizError, GlobalError};
 use log::error;
 use once_cell::sync::Lazy;
-use exception::{BizError, GlobalError};
+use std::borrow::Cow;
 
 pub struct ErrorRegistration {
     pub register: fn(&DashMap<u16, Cow<'static, str>>),
@@ -22,23 +22,18 @@ static REGISTRY: Lazy<DashMap<u16, Cow<'static, str>>> = Lazy::new(|| {
 pub trait CodeOutErr {
     fn out_err(&self) -> Cow<'static, str>;
 }
-impl CodeOutErr for GlobalError{
+impl CodeOutErr for GlobalError {
     fn out_err(&self) -> Cow<'static, str> {
         match self {
-            GlobalError::BizErr(BizError{ code,msg }) => {
-                match REGISTRY
-                    .get(code) {
-                    None => {
-                        error!("Out error [BIZ]: {}",msg);
-                        Cow::Borrowed("系统繁忙！请稍后重试。")
-                    }
-                    Some(e) => {
-                        e.clone()
-                    }
+            GlobalError::BizErr(BizError { code, msg }) => match REGISTRY.get(code) {
+                None => {
+                    error!("Out error [BIZ]: {}", msg);
+                    Cow::Borrowed("系统繁忙！请稍后重试。")
                 }
-            }
+                Some(e) => e.clone(),
+            },
             GlobalError::SysErr(e) => {
-                error!("Out error [SYSTEM]: {}",e);
+                error!("Out error [SYSTEM]: {}", e);
                 Cow::Borrowed("系统繁忙！请稍后重试。")
             }
         }
@@ -126,9 +121,17 @@ define_errors! {
 }
 
 #[test]
-fn test_err_out(){
-    let cow = GlobalError::BizErr(BizError { code: 1140, msg: "aaaa".to_string() }).out_err();
-    println!("{}",cow);
-    let cow = GlobalError::BizErr(BizError { code: 11950, msg: "aaaa".to_string() }).out_err();
-    println!("{}",cow);
+fn test_err_out() {
+    let cow = GlobalError::BizErr(BizError {
+        code: 1140,
+        msg: "aaaa".to_string(),
+    })
+    .out_err();
+    println!("{}", cow);
+    let cow = GlobalError::BizErr(BizError {
+        code: 11950,
+        msg: "aaaa".to_string(),
+    })
+    .out_err();
+    println!("{}", cow);
 }

@@ -20,7 +20,10 @@ pub enum GlobalError {
 impl GlobalError {
     pub fn new_biz_error<O: FnOnce(Arguments)>(code: u16, msg: &str, op: O) -> Self {
         op(format_args!("biz err = [code = {code}, msg=\"{msg}\"]"));
-        Self::BizErr(BizError { code, msg: msg.to_string() })
+        Self::BizErr(BizError {
+            code,
+            msg: msg.to_string(),
+        })
     }
 
     pub fn new_sys_error<O: FnOnce(Arguments)>(msg: &str, op: O) -> Self {
@@ -42,7 +45,11 @@ pub struct BizError {
 impl std::error::Error for BizError {}
 impl Display for BizError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "BizError: [code = {}, msg = \"{}\"]", self.code, self.msg)
+        write!(
+            f,
+            "BizError: [code = {}, msg = \"{}\"]",
+            self.code, self.msg
+        )
     }
 }
 
@@ -67,7 +74,9 @@ where
 
     fn hand_biz_log<O: FnOnce(&str)>(self, code: u16, msg: &str, op: O) -> GlobalResult<T> {
         self.map_err(|e| {
-            op(&format!("Trace = [code = {code}, msg=\"{msg}\"]; source = [{e:?}]"));
+            op(&format!(
+                "Trace = [code = {code}, msg=\"{msg}\"]; source = [{e:?}]"
+            ));
             GlobalError::BizErr(BizError {
                 code,
                 msg: msg.to_string(),

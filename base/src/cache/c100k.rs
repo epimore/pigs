@@ -261,7 +261,8 @@ impl<K: CacheKey> Shard<K> {
             self.wheel_l2[(e.expire_tick / WHEEL_L1 as u64) as usize % WHEEL_L2]
                 .push((idx, e.version));
         } else {
-            self.wheel_l3[(e.expire_tick / (WHEEL_L1 as u64 * WHEEL_L2 as u64)) as usize % WHEEL_L3]
+            self.wheel_l3
+                [(e.expire_tick / (WHEEL_L1 as u64 * WHEEL_L2 as u64)) as usize % WHEEL_L3]
                 .push((idx, e.version));
         }
     }

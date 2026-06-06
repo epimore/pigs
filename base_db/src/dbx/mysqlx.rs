@@ -1,17 +1,17 @@
 use std::sync::LazyLock;
 use std::time::Duration;
 
-use base::log::{LevelFilter};
+use base::log::LevelFilter;
 use base::serde::Deserialize;
-use sqlx::{Connection, ConnectOptions, MySql, Pool};
 use sqlx::mysql::MySqlSslMode;
 use sqlx::pool::PoolOptions;
+use sqlx::{ConnectOptions, Connection, MySql, Pool};
 
-use base::cfg_lib::{conf};
+use base::cfg_lib::conf;
 
+use base::utils::crypto::default_decrypt;
 use base::{logger, serde_default};
-use base::utils::crypto::{default_decrypt};
-static MYSQL_POOL: LazyLock<Pool<MySql>> = LazyLock::new(||DbModel::build_pool_conn());
+static MYSQL_POOL: LazyLock<Pool<MySql>> = LazyLock::new(|| DbModel::build_pool_conn());
 
 pub fn get_conn_by_pool() -> &'static Pool<MySql> {
     &*MYSQL_POOL
@@ -35,25 +35,27 @@ serde_default!(default_pool_model, PoolModel, PoolModel::default());
 impl DbModel {
     fn build_pool_conn() -> Pool<MySql> {
         let model: DbModel = DbModel::conf();
-       let password = if model.pass_crypto_enable.unwrap_or(false) {
-             &*default_decrypt( &*model.pass).expect("mysql pass invalid")
-        }else {
-           &*model.pass
-       };
-        let mut conn_options = <<MySql as sqlx::Database>::Connection as Connection>::Options::new()
-            .host(&*model.host_or_ip)
-            .port(model.port)
-            .database(&*model.db_name)
-            .pipes_as_concat(false)
-            .username(&*model.user)
-            .password(password);
+        let password = if model.pass_crypto_enable.unwrap_or(false) {
+            &*default_decrypt(&*model.pass).expect("mysql pass invalid")
+        } else {
+            &*model.pass
+        };
+        let mut conn_options =
+            <<MySql as sqlx::Database>::Connection as Connection>::Options::new()
+                .host(&*model.host_or_ip)
+                .port(model.port)
+                .database(&*model.db_name)
+                .pipes_as_concat(false)
+                .username(&*model.user)
+                .password(password);
         if let Some(attr) = model.attrs {
             if let Some(log) = attr.log_global_sql_level {
                 let level = logger::level_filter(&*log);
                 conn_options = conn_options.log_statements(level);
             }
             if let Some(timeout) = attr.log_slow_sql_timeout {
-                conn_options = conn_options.log_slow_statements(LevelFilter::Warn, Duration::from_secs(timeout as u64));
+                conn_options = conn_options
+                    .log_slow_statements(LevelFilter::Warn, Duration::from_secs(timeout as u64));
             }
             if let Some(timezone) = attr.timezone {
                 conn_options = conn_options.timezone(Some(timezone));
@@ -63,13 +65,21 @@ impl DbModel {
             }
             match attr.ssl_level {
                 None | Some(1) => {}
-                Some(0) => { conn_options = conn_options.ssl_mode(MySqlSslMode::Disabled); }
-                Some(2) => { conn_options = conn_options.ssl_mode(MySqlSslMode::Required); }
-                Some(3) => { conn_options = conn_options.ssl_mode(MySqlSslMode::VerifyIdentity); }
+                Some(0) => {
+                    conn_options = conn_options.ssl_mode(MySqlSslMode::Disabled);
+                }
+                Some(2) => {
+                    conn_options = conn_options.ssl_mode(MySqlSslMode::Required);
+                }
+                Some(3) => {
+                    conn_options = conn_options.ssl_mode(MySqlSslMode::VerifyIdentity);
+                }
                 Some(4) => {
                     conn_options = conn_options.ssl_mode(MySqlSslMode::VerifyCa);
                 }
-                Some(other) => { panic!("连接无效加密等级:{other}") }
+                Some(other) => {
+                    panic!("连接无效加密等级:{other}")
+                }
             }
             if let Some(ca) = attr.ssl_ca_crt_file {
                 conn_options = conn_options.ssl_ca(ca)
@@ -81,7 +91,10 @@ impl DbModel {
                 conn_options = conn_options.ssl_client_key(key);
             }
         }
-        model.pool.build_pool_options().connect_lazy_with(conn_options)
+        model
+            .pool
+            .build_pool_options()
+            .connect_lazy_with(conn_options)
     }
 }
 

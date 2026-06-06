@@ -3,8 +3,8 @@ use std::{
     sync::Arc,
 };
 
-use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
+use dashmap::DashMap;
 use exception::typed::common::MessageBusError;
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
@@ -29,9 +29,7 @@ impl TypedMessageBus {
         let (tx, rx) = mpsc::channel::<Box<dyn Any + Send + Sync>>(DEFAULT_CHANNEL_SIZE);
         let type_id = TypeId::of::<T>();
         match self.channels.entry(type_id) {
-            Entry::Occupied(_) => {
-                Err(MessageBusError::AlreadyExists)
-            }
+            Entry::Occupied(_) => Err(MessageBusError::AlreadyExists),
             Entry::Vacant(val) => {
                 val.insert(tx);
                 Ok(TypedReceiver::new(rx))
@@ -44,13 +42,14 @@ impl TypedMessageBus {
         T: Send + Sync + 'static,
     {
         let type_id = TypeId::of::<T>();
-        let entry = self.channels.get(&type_id).ok_or(MessageBusError::NotFound)?;
-        entry
-            .try_send(Box::new(msg))
-            .map_err(|err| match err {
-                mpsc::error::TrySendError::Full(_) => MessageBusError::Full,
-                mpsc::error::TrySendError::Closed(_) => MessageBusError::ChannelClosed,
-            })
+        let entry = self
+            .channels
+            .get(&type_id)
+            .ok_or(MessageBusError::NotFound)?;
+        entry.try_send(Box::new(msg)).map_err(|err| match err {
+            mpsc::error::TrySendError::Full(_) => MessageBusError::Full,
+            mpsc::error::TrySendError::Closed(_) => MessageBusError::ChannelClosed,
+        })
     }
 
     pub async fn publish<T>(&self, msg: T) -> Result<(), MessageBusError>
@@ -58,7 +57,10 @@ impl TypedMessageBus {
         T: Send + Sync + 'static,
     {
         let type_id = TypeId::of::<T>();
-        let entry = self.channels.get(&type_id).ok_or(MessageBusError::NotFound)?;
+        let entry = self
+            .channels
+            .get(&type_id)
+            .ok_or(MessageBusError::NotFound)?;
         entry
             .send(Box::new(msg))
             .await
@@ -79,7 +81,10 @@ where
     T: Send + Sync + 'static,
 {
     pub fn new(inner: mpsc::Receiver<Box<dyn Any + Send + Sync>>) -> Self {
-        Self { inner, _marker: std::marker::PhantomData }
+        Self {
+            inner,
+            _marker: std::marker::PhantomData,
+        }
     }
     pub fn try_recv(&mut self) -> Result<T, MessageBusError> {
         match self.inner.try_recv() {

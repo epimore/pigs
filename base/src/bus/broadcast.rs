@@ -4,9 +4,9 @@ use std::{
 };
 
 use dashmap::DashMap;
+use exception::typed::common::MessageBusError;
 use tokio::sync::broadcast;
 use tokio::time::{timeout, Duration};
-use exception::typed::common::MessageBusError;
 
 const DEFAULT_CHANNEL_SIZE: usize = 64;
 
@@ -22,7 +22,10 @@ impl TypedMessageBus {
         }
     }
 
-    pub fn publish<T>(&self, msg: T) -> Result<usize, broadcast::error::SendError<Arc<dyn Any + Send + Sync>>>
+    pub fn publish<T>(
+        &self,
+        msg: T,
+    ) -> Result<usize, broadcast::error::SendError<Arc<dyn Any + Send + Sync>>>
     where
         T: Send + Sync + 'static + Clone,
     {
@@ -34,7 +37,10 @@ impl TypedMessageBus {
         entry.send(Arc::new(msg))
     }
 
-    pub fn publish_ref<T>(&self, msg: &T) -> Result<usize, broadcast::error::SendError<Arc<dyn Any + Send + Sync>>>
+    pub fn publish_ref<T>(
+        &self,
+        msg: &T,
+    ) -> Result<usize, broadcast::error::SendError<Arc<dyn Any + Send + Sync>>>
     where
         T: Send + Sync + 'static + Clone,
     {

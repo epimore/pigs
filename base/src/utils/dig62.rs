@@ -1,12 +1,16 @@
-use std::collections::HashMap;
-use log::{debug, error};
 use exception::{GlobalError, GlobalResult};
+use log::{debug, error};
+use std::collections::HashMap;
 
 const D_SIZE: usize = 10;
 const A_SIZE: usize = 52;
 const D_DIC: [char; D_SIZE] = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'];
 //按键盘从上至下，从左到右形成小写、大写字母字典表
-const A_DIC: [char; A_SIZE] = ['q', 'a', 'z', 'w', 's', 'x', 'e', 'd', 'c', 'r', 'f', 'v', 't', 'g', 'b', 'y', 'h', 'n', 'u', 'j', 'm', 'i', 'k', 'o', 'l', 'p', 'Q', 'A', 'Z', 'W', 'S', 'X', 'E', 'D', 'C', 'R', 'F', 'V', 'T', 'G', 'B', 'Y', 'H', 'N', 'U', 'J', 'M', 'I', 'K', 'O', 'L', 'P'];
+const A_DIC: [char; A_SIZE] = [
+    'q', 'a', 'z', 'w', 's', 'x', 'e', 'd', 'c', 'r', 'f', 'v', 't', 'g', 'b', 'y', 'h', 'n', 'u',
+    'j', 'm', 'i', 'k', 'o', 'l', 'p', 'Q', 'A', 'Z', 'W', 'S', 'X', 'E', 'D', 'C', 'R', 'F', 'V',
+    'T', 'G', 'B', 'Y', 'H', 'N', 'U', 'J', 'M', 'I', 'K', 'O', 'L', 'P',
+];
 
 /// 将10进制纯数字字符串，按照字典表生成新的字符串；长度压缩到58%；对称压缩
 /// en 编码
@@ -14,7 +18,9 @@ const A_DIC: [char; A_SIZE] = ['q', 'a', 'z', 'w', 's', 'x', 'e', 'd', 'c', 'r',
 pub fn en(digit_str: &str) -> GlobalResult<String> {
     let mut tmp_key0 = String::new();
     for ch in digit_str.chars() {
-        let digit = ch.to_digit(10).ok_or_else(|| GlobalError::new_sys_error("Invalid digit_str", |msg| error!("{msg}")))?;
+        let digit = ch.to_digit(10).ok_or_else(|| {
+            GlobalError::new_sys_error("Invalid digit_str", |msg| error!("{msg}"))
+        })?;
         tmp_key0.push_str(&format!("{:04b}", digit));
     }
     let remainder = tmp_key0.len() % 9;
@@ -43,12 +49,18 @@ pub fn en(digit_str: &str) -> GlobalResult<String> {
 
 pub fn de(num62: &str) -> GlobalResult<String> {
     let mut ori_chars = num62.chars();
-    let header = ori_chars.next().ok_or_else(|| GlobalError::new_sys_error("Too short to miss header", |msg| error!("{msg}")))?;
+    let header = ori_chars.next().ok_or_else(|| {
+        GlobalError::new_sys_error("Too short to miss header", |msg| error!("{msg}"))
+    })?;
     let mut a_dic_map: HashMap<char, usize> = HashMap::new();
     for (i, ch) in A_DIC.iter().enumerate() {
         a_dic_map.insert(*ch, i);
     }
-    let pad_len = *a_dic_map.get(&header).ok_or_else(|| GlobalError::new_sys_error("Illegal alphabet character by header", |msg| error!("{msg}")))?;
+    let pad_len = *a_dic_map.get(&header).ok_or_else(|| {
+        GlobalError::new_sys_error("Illegal alphabet character by header", |msg| {
+            error!("{msg}")
+        })
+    })?;
 
     let mut d_dic_map: HashMap<char, usize> = HashMap::new();
     for (i, ch) in D_DIC.iter().enumerate() {
@@ -62,16 +74,23 @@ pub fn de(num62: &str) -> GlobalResult<String> {
         let a_ch;
 
         if chars[i].is_digit(10) {
-            circle = *d_dic_map.get(&chars[i]).ok_or_else(|| GlobalError::new_sys_error("Illegal digit character", |msg| error!("{msg}")))?;
+            circle = *d_dic_map.get(&chars[i]).ok_or_else(|| {
+                GlobalError::new_sys_error("Illegal digit character", |msg| error!("{msg}"))
+            })?;
             i += 1;
             if i >= chars.len() {
-                return Err(GlobalError::new_sys_error("Digit num cannot be at the end", |msg| error!("{msg}")));
+                return Err(GlobalError::new_sys_error(
+                    "Digit num cannot be at the end",
+                    |msg| error!("{msg}"),
+                ));
             }
             a_ch = chars[i];
         } else {
             a_ch = chars[i];
         }
-        let index = *a_dic_map.get(&a_ch).ok_or_else(|| GlobalError::new_sys_error("Illegal alphabet character", |msg| error!("{msg}")))?;
+        let index = *a_dic_map.get(&a_ch).ok_or_else(|| {
+            GlobalError::new_sys_error("Illegal alphabet character", |msg| error!("{msg}"))
+        })?;
         let val = circle * 52 + index;
         binary_str.push_str(&format!("{:09b}", val)); // 保证9位
         i += 1;

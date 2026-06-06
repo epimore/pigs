@@ -1,7 +1,6 @@
-
-use std::{time::Duration};
-use tokio::time::sleep;
 use base::bus::broadcast::TypedMessageBus;
+use std::time::Duration;
+use tokio::time::sleep;
 
 #[tokio::main]
 async fn main() {
@@ -33,16 +32,21 @@ async fn main() {
     });
 
     println!("Publishing messages...");
-    bus.publish("hello world".to_string()).expect("TODO: panic message");
+    bus.publish("hello world".to_string())
+        .expect("TODO: panic message");
     bus.publish(42_u32).expect("TODO: panic message");
-    bus.publish(User { name: "Alice".into(), age: 30, sex: false }).expect("TODO: panic message");
+    bus.publish(User {
+        name: "Alice".into(),
+        age: 30,
+        sex: false,
+    })
+    .expect("TODO: panic message");
     if let Ok(user) = sub_user1.try_recv() {
         println!("[User1] received: {:?}", user);
     }
     sleep(Duration::from_secs(2)).await;
     println!("Done.");
 }
-
 
 #[derive(Debug, Default, Clone)]
 struct User {

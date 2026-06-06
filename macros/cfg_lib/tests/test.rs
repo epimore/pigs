@@ -1,10 +1,9 @@
 #[allow(dead_code, unused_imports)]
 mod test1 {
+    use cfg_lib::conf::{init_cfg, CheckFromConf, FieldCheckError};
+    use cfg_macro::conf;
     use serde::Deserialize;
     use serde::Deserializer;
-    use cfg_lib::conf::{CheckFromConf, FieldCheckError, init_cfg};
-    use cfg_macro::conf;
-
 
     #[derive(Debug, Deserialize)]
     #[conf(lib)]
@@ -41,7 +40,7 @@ mod test1 {
         logging: bool,
         metrics: bool,
         #[serde(default)]
-        miss:u8,
+        miss: u8,
     }
 
     #[derive(Debug, Deserialize)]
@@ -60,7 +59,9 @@ mod test1 {
         miss: u8,
     }
 
-    fn miss_from_serde_default() -> u8 { 7 }
+    fn miss_from_serde_default() -> u8 {
+        7
+    }
 
     #[derive(Debug, Deserialize)]
     #[conf(path = "tests/cfg1.yaml", prefix = "features", lib)]
@@ -134,7 +135,7 @@ mod test1 {
     #[test]
     fn test_prefix_conf_serde_default_priority() {
         let conf = FeaturesSerdeDefault::conf();
-        println!("{:?}",conf);
+        println!("{:?}", conf);
         assert_eq!(conf.miss, 7);
     }
 

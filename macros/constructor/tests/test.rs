@@ -1,4 +1,4 @@
-use constructor::{Get, Set, New};
+use constructor::{Get, New, Set};
 
 #[derive(Set, Get, New, Default, Debug, PartialEq)]
 pub struct Foo {
@@ -11,14 +11,18 @@ pub struct Foo {
 #[test]
 fn test_foo() {
     let mut foo = Foo::new(112i32, String::from("abc"), true, Some(12u32));
-    let rf = Foo { a: 112, b: "abc".to_string(), c: true, d: Some(12u32) };
+    let rf = Foo {
+        a: 112,
+        b: "abc".to_string(),
+        c: true,
+        d: Some(12u32),
+    };
     assert_eq!(&foo, &rf);
     foo.set_a(456);
     foo.set_b("bb".to_string());
     assert_eq!(foo.get_a(), &456i32);
     assert_eq!(foo.get_b(), &"bb".to_string());
 }
-
 
 #[derive(Set, Get, New, Default, Debug, PartialEq)]
 #[set(b, c)]
@@ -34,7 +38,12 @@ pub struct Bar {
 #[test]
 fn test_bar() {
     let mut bar = Bar::new("bbb".to_string(), true);
-    let rb = Bar { a: 0, b: String::from("bbb"), c: true, d: 0.0f32 };
+    let rb = Bar {
+        a: 0,
+        b: String::from("bbb"),
+        c: true,
+        d: 0.0f32,
+    };
     assert_eq!(&bar, &rb);
     bar.set_b("nb");
     bar.set_c(false);
@@ -58,7 +67,6 @@ fn test_un_foo() {
     assert_eq!(un_foo.get_2(), &false);
 }
 
-
 #[derive(Set, Get, New, Default, Debug, PartialEq)]
 #[set(0, 2)]
 #[get(0, 2)]
@@ -75,6 +83,3 @@ fn test_un_bar() {
     assert_eq!(un_bar.get_0(), &111u32);
     assert_eq!(un_bar.get_2(), &false);
 }
-
-
-

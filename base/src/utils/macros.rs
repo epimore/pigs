@@ -8,7 +8,7 @@ macro_rules! serde_default {
 }
 
 #[cfg(test)]
-mod tests{
+mod tests {
     use serde::{Deserialize, Serialize};
 
     #[derive(Serialize, Deserialize, Debug)]
@@ -26,4 +26,3 @@ mod tests{
         println!("{:?}", config); // Config { host: "localhost", port: 8080 }
     }
 }
-

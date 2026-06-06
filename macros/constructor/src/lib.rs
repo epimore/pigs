@@ -1,10 +1,10 @@
 use proc_macro::TokenStream;
 use proc_macro2::Ident;
 use quote::{format_ident, quote};
-use syn::{Attribute, Data, DeriveInput, Field, Fields, Index, Meta, Token, Type};
 use syn::parse::Parse;
 use syn::punctuated::Punctuated;
 use syn::token::Comma;
+use syn::{Attribute, Data, DeriveInput, Field, Fields, Index, Meta, Token, Type};
 
 const IDENT_GET: &str = "get";
 const IDENT_SET: &str = "set";
@@ -28,9 +28,13 @@ pub fn drive_new(input: TokenStream) -> TokenStream {
 fn drive(input: TokenStream, ident: &str) -> TokenStream {
     let ast: DeriveInput = syn::parse(input).expect("syn parse failed");
     let res = match ast.data {
-        Data::Struct(ref s) => { handle_struct(&ast, &s.fields, ident) }
-        Data::Enum(_) => { panic!("enum is not supported") }
-        Data::Union(_) => { panic!("union is not supported") }
+        Data::Struct(ref s) => handle_struct(&ast, &s.fields, ident),
+        Data::Enum(_) => {
+            panic!("enum is not supported")
+        }
+        Data::Union(_) => {
+            panic!("union is not supported")
+        }
     };
     res.into()
 }
@@ -45,45 +49,51 @@ enum ConstructorIdent {
 
 fn handle_struct(ast: &DeriveInput, fields: &Fields, ident: &str) -> proc_macro2::TokenStream {
     match *fields {
-        Fields::Named(ref fields) => {
-            match ident {
-                IDENT_GET => {
-                    let constructor_ident = ConstructorIdent::Get(true);
-                    build_constructor(ast, &fields.named, constructor_ident)
-                }
-                IDENT_SET => {
-                    let constructor_ident = ConstructorIdent::Set(true);
-                    build_constructor(ast, &fields.named, constructor_ident)
-                }
-                IDENT_NEW => {
-                    let constructor_ident = ConstructorIdent::New(true);
-                    build_constructor(ast, &fields.named, constructor_ident)
-                }
-                &_ => { panic!("invalid ident") }
+        Fields::Named(ref fields) => match ident {
+            IDENT_GET => {
+                let constructor_ident = ConstructorIdent::Get(true);
+                build_constructor(ast, &fields.named, constructor_ident)
             }
-        }
-        Fields::Unnamed(ref fields) => {
-            match ident {
-                IDENT_GET => {
-                    let constructor_ident = ConstructorIdent::Get(false);
-                    build_constructor(ast, &fields.unnamed, constructor_ident)
-                }
-                IDENT_SET => {
-                    let constructor_ident = ConstructorIdent::Set(false);
-                    build_constructor(ast, &fields.unnamed, constructor_ident)
-                }
-                IDENT_NEW => {
-                    let constructor_ident = ConstructorIdent::New(false);
-                    build_constructor(ast, &fields.unnamed, constructor_ident)
-                }
-                &_ => { panic!("invalid ident") }
+            IDENT_SET => {
+                let constructor_ident = ConstructorIdent::Set(true);
+                build_constructor(ast, &fields.named, constructor_ident)
             }
+            IDENT_NEW => {
+                let constructor_ident = ConstructorIdent::New(true);
+                build_constructor(ast, &fields.named, constructor_ident)
+            }
+            &_ => {
+                panic!("invalid ident")
+            }
+        },
+        Fields::Unnamed(ref fields) => match ident {
+            IDENT_GET => {
+                let constructor_ident = ConstructorIdent::Get(false);
+                build_constructor(ast, &fields.unnamed, constructor_ident)
+            }
+            IDENT_SET => {
+                let constructor_ident = ConstructorIdent::Set(false);
+                build_constructor(ast, &fields.unnamed, constructor_ident)
+            }
+            IDENT_NEW => {
+                let constructor_ident = ConstructorIdent::New(false);
+                build_constructor(ast, &fields.unnamed, constructor_ident)
+            }
+            &_ => {
+                panic!("invalid ident")
+            }
+        },
+        Fields::Unit => {
+            panic!("Unit struct is not supported")
         }
-        Fields::Unit => { panic!("Unit struct is not supported") }
     }
 }
 
-fn build_constructor(ast: &DeriveInput, fields: &Punctuated<Field, Token![,]>, constructor_ident: ConstructorIdent) -> proc_macro2::TokenStream {
+fn build_constructor(
+    ast: &DeriveInput,
+    fields: &Punctuated<Field, Token![,]>,
+    constructor_ident: ConstructorIdent,
+) -> proc_macro2::TokenStream {
     let constructors = match constructor_ident {
         ConstructorIdent::Get(true) => {
             build_et_named_fn(build_named_get_constructor, ast, fields, IDENT_GET)
@@ -97,12 +107,8 @@ fn build_constructor(ast: &DeriveInput, fields: &Punctuated<Field, Token![,]>, c
         ConstructorIdent::Set(false) => {
             build_et_unnamed_fn(build_unnamed_set_constructor, ast, fields, IDENT_SET)
         }
-        ConstructorIdent::New(true) => {
-            build_named_new_constructor(ast, fields, IDENT_NEW)
-        }
-        ConstructorIdent::New(false) => {
-            build_unnamed_new_constructor(ast, fields, IDENT_NEW)
-        }
+        ConstructorIdent::New(true) => build_named_new_constructor(ast, fields, IDENT_NEW),
+        ConstructorIdent::New(false) => build_unnamed_new_constructor(ast, fields, IDENT_NEW),
     };
     let name = &ast.ident;
     let (i, t, w) = ast.generics.split_for_impl();
@@ -114,8 +120,11 @@ fn build_constructor(ast: &DeriveInput, fields: &Punctuated<Field, Token![,]>, c
     }
 }
 
-
-fn build_unnamed_new_constructor(ast: &DeriveInput, fields: &Punctuated<Field, Token![,]>, ident: &str) -> proc_macro2::TokenStream {
+fn build_unnamed_new_constructor(
+    ast: &DeriveInput,
+    fields: &Punctuated<Field, Token![,]>,
+    ident: &str,
+) -> proc_macro2::TokenStream {
     let args = parse_args::<Index>(&ast.attrs, ident);
     let mut field_vars = Vec::new();
     let mut field_names = Vec::new();
@@ -124,7 +133,7 @@ fn build_unnamed_new_constructor(ast: &DeriveInput, fields: &Punctuated<Field, T
         let index = Index::from(index);
         if contains_fields(&args, &index) {
             let field_type = &field.ty;
-            let field_name = format_ident!("field_{}",index);
+            let field_name = format_ident!("field_{}", index);
             field_names.push(field_name.clone());
             field_types.push(field_type);
             field_vars.push(quote!(#field_name));
@@ -133,29 +142,37 @@ fn build_unnamed_new_constructor(ast: &DeriveInput, fields: &Punctuated<Field, T
         }
     }
     quote! {
-            pub fn new(#(#field_names:#field_types),*)->Self{
-                Self(#(#field_vars),*)
-            }
+        pub fn new(#(#field_names:#field_types),*)->Self{
+            Self(#(#field_vars),*)
         }
+    }
 }
 
-fn build_named_new_constructor(ast: &DeriveInput, fields: &Punctuated<Field, Token![,]>, ident: &str) -> proc_macro2::TokenStream {
+fn build_named_new_constructor(
+    ast: &DeriveInput,
+    fields: &Punctuated<Field, Token![,]>,
+    ident: &str,
+) -> proc_macro2::TokenStream {
     let args = parse_args::<Ident>(&ast.attrs, ident);
     let mut b = false;
-    let (field_names, field_types): (Vec<Ident>, Vec<Type>) = fields.iter().map(|field| {
-        let field_name = field.ident.as_ref().unwrap();
-        (field_name, field)
-    }).filter(|(field_name, _field)| {
-        let t = contains_fields(&args, field_name);
-        if !t {
-            b = true;
-        }
-        t
-    })
+    let (field_names, field_types): (Vec<Ident>, Vec<Type>) = fields
+        .iter()
+        .map(|field| {
+            let field_name = field.ident.as_ref().unwrap();
+            (field_name, field)
+        })
+        .filter(|(field_name, _field)| {
+            let t = contains_fields(&args, field_name);
+            if !t {
+                b = true;
+            }
+            t
+        })
         .map(|(field_name, field)| {
             let field_type = &field.ty;
             (field_name.clone(), field_type.clone())
-        }).unzip();
+        })
+        .unzip();
     if b {
         quote! {
             pub fn new(#(#field_names:#field_types),*)->Self{
@@ -171,8 +188,15 @@ fn build_named_new_constructor(ast: &DeriveInput, fields: &Punctuated<Field, Tok
     }
 }
 
-fn build_et_named_fn<F>(f: F, ast: &DeriveInput, fields: &Punctuated<Field, Token![,]>, ident: &str) -> proc_macro2::TokenStream
-    where F: Fn(&Ident, &Type, Ident) -> proc_macro2::TokenStream {
+fn build_et_named_fn<F>(
+    f: F,
+    ast: &DeriveInput,
+    fields: &Punctuated<Field, Token![,]>,
+    ident: &str,
+) -> proc_macro2::TokenStream
+where
+    F: Fn(&Ident, &Type, Ident) -> proc_macro2::TokenStream,
+{
     let args = parse_args::<Ident>(&ast.attrs, ident);
     let mut constructors = quote!();
     for field in fields {
@@ -181,7 +205,7 @@ fn build_et_named_fn<F>(f: F, ast: &DeriveInput, fields: &Punctuated<Field, Toke
         if !contains_fields(&args, field_name) {
             continue;
         }
-        let constructor_name = format_ident!("{ident}_{}",field_name);
+        let constructor_name = format_ident!("{ident}_{}", field_name);
         let constructor = f(field_name, field_type, constructor_name);
         constructors = quote! {
             #constructors
@@ -191,8 +215,15 @@ fn build_et_named_fn<F>(f: F, ast: &DeriveInput, fields: &Punctuated<Field, Toke
     constructors
 }
 
-fn build_et_unnamed_fn<F>(f: F, ast: &DeriveInput, fields: &Punctuated<Field, Token![,]>, ident: &str) -> proc_macro2::TokenStream
-    where F: Fn(&Index, &Type, Ident) -> proc_macro2::TokenStream {
+fn build_et_unnamed_fn<F>(
+    f: F,
+    ast: &DeriveInput,
+    fields: &Punctuated<Field, Token![,]>,
+    ident: &str,
+) -> proc_macro2::TokenStream
+where
+    F: Fn(&Index, &Type, Ident) -> proc_macro2::TokenStream,
+{
     let args = parse_args::<Index>(&ast.attrs, ident);
     let mut constructors = quote!();
     for (index, field) in fields.iter().enumerate() {
@@ -201,7 +232,7 @@ fn build_et_unnamed_fn<F>(f: F, ast: &DeriveInput, fields: &Punctuated<Field, To
         if !contains_fields(&args, &index) {
             continue;
         }
-        let constructor_name = format_ident!("{ident}_{}",index);
+        let constructor_name = format_ident!("{ident}_{}", index);
         let constructor = f(&index, field_type, constructor_name);
         constructors = quote! {
             #constructors
@@ -211,55 +242,76 @@ fn build_et_unnamed_fn<F>(f: F, ast: &DeriveInput, fields: &Punctuated<Field, To
     constructors
 }
 
-fn build_unnamed_get_constructor(index: &Index, field_type: &Type, constructor_name: Ident) -> proc_macro2::TokenStream {
+fn build_unnamed_get_constructor(
+    index: &Index,
+    field_type: &Type,
+    constructor_name: Ident,
+) -> proc_macro2::TokenStream {
+    let constructor = quote! {
+    #[allow(non_snake_case)]
+        pub fn #constructor_name(&self) ->&#field_type{
+            &self.#index
+        }
+    };
+    constructor
+}
+
+fn build_named_get_constructor(
+    field_name: &Ident,
+    field_type: &Type,
+    constructor_name: Ident,
+) -> proc_macro2::TokenStream {
     let constructor = quote! {
         #[allow(non_snake_case)]
-            pub fn #constructor_name(&self) ->&#field_type{
-                &self.#index
-            }
-        };
+        pub fn #constructor_name(&self) -> &#field_type{
+            &self.#field_name
+        }
+    };
     constructor
 }
 
-fn build_named_get_constructor(field_name: &Ident, field_type: &Type, constructor_name: Ident) -> proc_macro2::TokenStream {
-    let constructor = quote! {
-            #[allow(non_snake_case)]
-            pub fn #constructor_name(&self) -> &#field_type{
-                &self.#field_name
-            }
-        };
-    constructor
-}
-
-fn build_unnamed_set_constructor(index: &Index, field_type: &Type, constructor_name: Ident) -> proc_macro2::TokenStream {
-    let param_name = format_ident!("field_{}",index);
-    let constructor = quote! {
-            #[allow(non_snake_case)]
-            pub fn #constructor_name(&mut self,#param_name:impl Into<#field_type>) {
-                self.#index = #param_name.into();
-            }
-        };
-    constructor
-}
-
-fn build_named_set_constructor(field_name: &Ident, field_type: &Type, constructor_name: Ident) -> proc_macro2::TokenStream {
+fn build_unnamed_set_constructor(
+    index: &Index,
+    field_type: &Type,
+    constructor_name: Ident,
+) -> proc_macro2::TokenStream {
+    let param_name = format_ident!("field_{}", index);
     let constructor = quote! {
         #[allow(non_snake_case)]
-            pub fn #constructor_name(&mut self,#field_name:impl Into<#field_type>) {
-                self.#field_name = #field_name.into();
-            }
-        };
+        pub fn #constructor_name(&mut self,#param_name:impl Into<#field_type>) {
+            self.#index = #param_name.into();
+        }
+    };
+    constructor
+}
+
+fn build_named_set_constructor(
+    field_name: &Ident,
+    field_type: &Type,
+    constructor_name: Ident,
+) -> proc_macro2::TokenStream {
+    let constructor = quote! {
+    #[allow(non_snake_case)]
+        pub fn #constructor_name(&mut self,#field_name:impl Into<#field_type>) {
+            self.#field_name = #field_name.into();
+        }
+    };
     constructor
 }
 
 fn parse_args<T: Parse>(attrs: &Vec<Attribute>, ident: &str) -> Option<Punctuated<T, Comma>> {
     if let Some(attr) = attrs.iter().find(|attr| attr.path().is_ident(ident)) {
         match &attr.meta {
-            Meta::Path(_) => { panic!("`{ident}` attribute should like `#[{ident}(a, b, c)]`") }
-            Meta::List(list) => {
-                Some(list.parse_args_with(Punctuated::<T, Comma>::parse_terminated).expect("parse args failed"))
+            Meta::Path(_) => {
+                panic!("`{ident}` attribute should like `#[{ident}(a, b, c)]`")
             }
-            Meta::NameValue(_) => { panic!("`{ident}` attribute should like `#[{ident}(a, b, c)]`") }
+            Meta::List(list) => Some(
+                list.parse_args_with(Punctuated::<T, Comma>::parse_terminated)
+                    .expect("parse args failed"),
+            ),
+            Meta::NameValue(_) => {
+                panic!("`{ident}` attribute should like `#[{ident}(a, b, c)]`")
+            }
         }
     } else {
         None
