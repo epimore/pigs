@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::path::PathBuf;
 
 use chrono::Local;
@@ -75,12 +76,13 @@ impl Logger {
 
         let formatter =
             move |out: fern::FormatCallback, msg: &std::fmt::Arguments, record: &log::Record| {
+                let source_file = display_source_file(record.file().unwrap_or("unknown"));
                 out.finish(format_args!(
                     "[{}] [{}] [{}] {}:{} >> {}",
                     Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
                     colors.color(record.level()),
                     record.target(),
-                    record.file().unwrap_or("unknown"),
+                    source_file,
                     record.line().unwrap_or(0),
                     msg,
                 ))
@@ -152,6 +154,31 @@ impl Logger {
     }
 }
 
+fn display_source_file(file: &str) -> Cow<'_, str> {
+    let windows_absolute =
+        file.starts_with("\\\\") || matches!(file.as_bytes(), [_, b':', b'\\' | b'/', ..]);
+    if !file.starts_with('/') && !windows_absolute {
+        return Cow::Borrowed(file);
+    }
+
+    if file.contains('\\') {
+        let normalized = file.replace('\\', "/");
+        return Cow::Owned(
+            trim_source_root(&normalized)
+                .unwrap_or(&normalized)
+                .to_string(),
+        );
+    }
+
+    Cow::Borrowed(trim_source_root(file).unwrap_or(file))
+}
+
+fn trim_source_root(file: &str) -> Option<&str> {
+    let src = file.rfind("/src/")?;
+    let crate_start = file[..src].rfind('/').map_or(0, |index| index + 1);
+    Some(&file[crate_start..])
+}
+
 // target 匹配逻辑
 fn match_target(target: &str, rules: &[String]) -> bool {
     rules.iter().any(|r| {
@@ -182,4 +209,29 @@ where
     let level = String::deserialize(deserializer)?;
     level_filter(&*level);
     Ok(level)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::display_source_file;
+
+    #[test]
+    fn shortens_absolute_source_paths() {
+        assert_eq!(
+            display_source_file("/home/ubuntu20/code/rs/mv/github/epimore/gmv_pjsip/src/io.rs"),
+            "gmv_pjsip/src/io.rs"
+        );
+        assert_eq!(
+            display_source_file(r"C:\code\epimore\gmv_pjsip\src\io.rs"),
+            "gmv_pjsip/src/io.rs"
+        );
+    }
+
+    #[test]
+    fn keeps_relative_source_paths() {
+        assert_eq!(
+            display_source_file("session/src/http/hook.rs"),
+            "session/src/http/hook.rs"
+        );
+    }
 }
