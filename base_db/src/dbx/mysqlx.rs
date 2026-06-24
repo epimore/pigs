@@ -1,16 +1,19 @@
 use std::sync::LazyLock;
 use std::time::Duration;
 
+use crate::sqlx::mysql::{MySqlConnectOptions, MySqlSslMode};
+use crate::sqlx::pool::PoolOptions;
+use crate::sqlx::{ConnectOptions, Connection, MySql, Pool};
 use base::log::LevelFilter;
 use base::serde::Deserialize;
-use sqlx::mysql::MySqlSslMode;
-use sqlx::pool::PoolOptions;
-use sqlx::{ConnectOptions, Connection, MySql, Pool};
 
 use base::cfg_lib::conf;
 
 use base::utils::crypto::default_decrypt;
 use base::{logger, serde_default};
+
+use crate::dbx::DatabasePoolConfig;
+use crate::DatabaseError;
 static MYSQL_POOL: LazyLock<Pool<MySql>> = LazyLock::new(|| DbModel::build_pool_conn());
 
 pub fn get_conn_by_pool() -> &'static Pool<MySql> {
@@ -36,66 +39,72 @@ impl DbModel {
     fn build_pool_conn() -> Pool<MySql> {
         let model: DbModel = DbModel::conf();
         let password = if model.pass_crypto_enable.unwrap_or(false) {
-            &*default_decrypt(&*model.pass).expect("mysql pass invalid")
+            default_decrypt(&model.pass).expect("mysql pass invalid")
         } else {
-            &*model.pass
+            model.pass.clone()
         };
-        let mut conn_options =
-            <<MySql as sqlx::Database>::Connection as Connection>::Options::new()
-                .host(&*model.host_or_ip)
+        let mut connection =
+            <<MySql as crate::sqlx::Database>::Connection as Connection>::Options::new()
+                .host(&model.host_or_ip)
                 .port(model.port)
-                .database(&*model.db_name)
+                .database(&model.db_name)
                 .pipes_as_concat(false)
-                .username(&*model.user)
-                .password(password);
-        if let Some(attr) = model.attrs {
-            if let Some(log) = attr.log_global_sql_level {
-                let level = logger::level_filter(&*log);
-                conn_options = conn_options.log_statements(level);
-            }
-            if let Some(timeout) = attr.log_slow_sql_timeout {
-                conn_options = conn_options
-                    .log_slow_statements(LevelFilter::Warn, Duration::from_secs(timeout as u64));
-            }
-            if let Some(timezone) = attr.timezone {
-                conn_options = conn_options.timezone(Some(timezone));
-            }
-            if let Some(charset) = attr.charset {
-                conn_options = conn_options.charset(&*charset);
-            }
-            match attr.ssl_level {
-                None | Some(1) => {}
-                Some(0) => {
-                    conn_options = conn_options.ssl_mode(MySqlSslMode::Disabled);
-                }
-                Some(2) => {
-                    conn_options = conn_options.ssl_mode(MySqlSslMode::Required);
-                }
-                Some(3) => {
-                    conn_options = conn_options.ssl_mode(MySqlSslMode::VerifyIdentity);
-                }
-                Some(4) => {
-                    conn_options = conn_options.ssl_mode(MySqlSslMode::VerifyCa);
-                }
-                Some(other) => {
-                    panic!("连接无效加密等级:{other}")
-                }
-            }
-            if let Some(ca) = attr.ssl_ca_crt_file {
-                conn_options = conn_options.ssl_ca(ca)
-            }
-            if let Some(cert) = attr.ssl_ca_client_cert_file {
-                conn_options = conn_options.ssl_client_cert(cert);
-            }
-            if let Some(key) = attr.ssl_ca_client_key_file {
-                conn_options = conn_options.ssl_client_key(key);
-            }
+                .username(&model.user)
+                .password(&password);
+        if let Some(attrs) = model.attrs {
+            connection = apply_attributes(connection, attrs);
         }
-        model
-            .pool
-            .build_pool_options()
-            .connect_lazy_with(conn_options)
+        build_mysql_pool(connection, model.pool.into()).expect("invalid mysql pool configuration")
     }
+}
+
+pub fn build_mysql_pool(
+    connection: MySqlConnectOptions,
+    pool: DatabasePoolConfig,
+) -> Result<Pool<MySql>, DatabaseError> {
+    pool.validate()?;
+    Ok(PoolOptions::<MySql>::new()
+        .max_connections(pool.max_size)
+        .min_connections(pool.min_idle.unwrap_or(0))
+        .acquire_timeout(pool.connection_timeout)
+        .max_lifetime(pool.max_lifetime)
+        .idle_timeout(pool.idle_timeout)
+        .test_before_acquire(pool.test_on_check_out)
+        .connect_lazy_with(connection))
+}
+
+fn apply_attributes(mut connection: MySqlConnectOptions, attrs: AttrsModel) -> MySqlConnectOptions {
+    if let Some(log) = attrs.log_global_sql_level {
+        connection = connection.log_statements(logger::level_filter(&log));
+    }
+    if let Some(timeout) = attrs.log_slow_sql_timeout {
+        connection = connection
+            .log_slow_statements(LevelFilter::Warn, Duration::from_secs(u64::from(timeout)));
+    }
+    if let Some(timezone) = attrs.timezone {
+        connection = connection.timezone(Some(timezone));
+    }
+    if let Some(charset) = attrs.charset {
+        connection = connection.charset(&charset);
+    }
+    connection = match attrs.ssl_level {
+        None | Some(1) => connection,
+        Some(0) => connection.ssl_mode(MySqlSslMode::Disabled),
+        Some(2) => connection.ssl_mode(MySqlSslMode::Required),
+        Some(3) => connection.ssl_mode(MySqlSslMode::VerifyIdentity),
+        Some(4) => connection.ssl_mode(MySqlSslMode::VerifyCa),
+        Some(other) => panic!("连接无效加密等级:{other}"),
+    };
+    if let Some(ca) = attrs.ssl_ca_crt_file {
+        connection = connection.ssl_ca(ca);
+    }
+    if let Some(cert) = attrs.ssl_ca_client_cert_file {
+        connection = connection.ssl_client_cert(cert);
+    }
+    if let Some(key) = attrs.ssl_ca_client_key_file {
+        connection = connection.ssl_client_key(key);
+    }
+    connection
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,17 +137,19 @@ struct PoolModel {
     check_health: bool,
 }
 
-impl PoolModel {
-    fn build_pool_options(self) -> PoolOptions<MySql> {
-        PoolOptions::<MySql>::new()
-            .max_connections(self.max_connections)
-            .min_connections(self.min_connections)
-            .acquire_timeout(Duration::from_secs(self.connection_timeout as u64))
-            .max_lifetime(Duration::from_secs(self.max_lifetime as u64))
-            .idle_timeout(Duration::from_secs(self.idle_timeout as u64))
-            .test_before_acquire(self.check_health)
+impl From<PoolModel> for DatabasePoolConfig {
+    fn from(value: PoolModel) -> Self {
+        Self {
+            max_size: value.max_connections,
+            min_idle: Some(value.min_connections),
+            connection_timeout: Duration::from_secs(u64::from(value.connection_timeout)),
+            max_lifetime: Some(Duration::from_secs(u64::from(value.max_lifetime))),
+            idle_timeout: Some(Duration::from_secs(u64::from(value.idle_timeout))),
+            test_on_check_out: value.check_health,
+        }
     }
 }
+
 serde_default!(default_max_connections, u32, DEFAULT_MAX_CONNECTIONS);
 serde_default!(default_min_connections, u32, DEFAULT_MIN_CONNECTIONS);
 serde_default!(default_connection_timeout, u8, DEFAULT_CONNECTION_TIMEOUT);

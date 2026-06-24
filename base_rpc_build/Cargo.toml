@@ -1,0 +1,9 @@
+[package]
+name = "base_rpc_build"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+
+[dependencies]
+protoc-bin-vendored = "3.2"
+tonic-prost-build = "0.14"

@@ -1,6 +1,14 @@
 [workspace]
 resolver = "2"
-members = ["base", "base_db", "exception","macros/cfg_lib","macros/constructor"]
+members = [
+    "base",
+    "base_db",
+    "base_rpc",
+    "base_rpc_build",
+    "exception",
+    "macros/cfg_lib",
+    "macros/constructor",
+]
 
 [workspace.dependencies]
 anyhow = "1"

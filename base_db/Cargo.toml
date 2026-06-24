@@ -2,12 +2,19 @@
 name = "base_db"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.95"
 
 [dependencies]
-base = {path = "../base"}
-sqlx = { version = "0.8", features = ["mysql","tls-rustls", "default","chrono","runtime-tokio"] }
-
+base = { path = "../base" }
+thiserror = { workspace = true }
+sqlx = { version = "0.9", optional = true, default-features = false, features = ["runtime-tokio", "tls-rustls", "chrono", "derive"] }
 
 [features]
-default = []
+default = ["mysql"]
+mysql = ["dep:sqlx", "sqlx/mysql"]
+sqlite = ["dep:sqlx", "sqlx/sqlite"]
+sqlite-bundled = ["sqlite"]
 net = ["base/net"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
