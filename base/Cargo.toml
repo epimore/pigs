@@ -36,6 +36,7 @@ base64 = "0.22"
 ctor = "0.2"
 hex = "0.4"
 sha2 = "0.10"
+hmac = "0.12"
 tokio-util = {version = "0.7",features = ["full"]}
 futures = "0.3"
 ahash = "0.8"

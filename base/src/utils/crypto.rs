@@ -5,6 +5,7 @@ use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use base64::Engine;
 use block_modes::block_padding::Pkcs7;
 use block_modes::{BlockMode, Cbc};
+use hmac::{Hmac, Mac};
 use log::error;
 use rand::seq::SliceRandom;
 use sha2::{Digest, Sha256};
@@ -81,6 +82,14 @@ impl Aes256GcmCipher {
     }
 }
 
+pub fn hmac_sha256_hex(secret: &[u8], parts: &[&[u8]]) -> GlobalResult<String> {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret).hand_log(|err| error!("{err}"))?;
+    for part in parts {
+        mac.update(part);
+    }
+    Ok(hex::encode(mac.finalize().into_bytes()))
+}
+
 pub fn generate_token(input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
@@ -138,7 +147,8 @@ mod test {
     use base64::Engine;
 
     use crate::utils::crypto::{
-        decrypt, default_decrypt, default_encrypt, encrypt, generate_token, Aes256GcmCipher,
+        decrypt, default_decrypt, default_encrypt, encrypt, generate_token, hmac_sha256_hex,
+        Aes256GcmCipher,
     };
 
     #[test]
@@ -174,6 +184,18 @@ mod test {
         println!(
             "{}",
             default_decrypt("clRXVjIzU1VrS3BEMXZmNxp5adMgQy599aQeu0tHYg0=").unwrap()
+        );
+    }
+
+    #[test]
+    fn hmac_sha256_hex_is_stable() {
+        let timestamp = "1234";
+        let payload = br#"{"ok":true}"#;
+        let signature = hmac_sha256_hex(b"secret", &[timestamp.as_bytes(), b".", payload]).unwrap();
+        assert_eq!(signature.len(), 64);
+        assert_eq!(
+            signature,
+            hmac_sha256_hex(b"secret", &[timestamp.as_bytes(), b".", payload]).unwrap()
         );
     }
 
