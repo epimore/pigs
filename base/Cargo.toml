@@ -28,6 +28,7 @@ libc = "0.2"
 #加解密
 aes = "0.7.5"
 block-modes = "0.8.1"
+aes-gcm = "0.10.3"
 #hex-literal = "0.2.1"
 rand = "0.8.4"
 bytebuffer = "0.2.1"

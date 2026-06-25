@@ -23,6 +23,7 @@ pub use paste;
 pub use serde;
 pub use serde_json;
 pub use serde_yaml;
+pub use sha2;
 
 pub mod bus;
 pub mod cache;
