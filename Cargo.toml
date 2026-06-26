@@ -6,6 +6,7 @@ members = [
     "base_rpc",
     "base_rpc_build",
     "exception",
+    "sys_metrics",
     "macros/cfg_lib",
     "macros/constructor",
 ]

@@ -1,0 +1,15 @@
+[package]
+name = "sys_metrics"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+sysinfo = { version = "0.37.2", default-features = false, features = ["system", "network"] }
