@@ -7,7 +7,7 @@ rust-version = "1.95"
 [dependencies]
 base = { path = "../base" }
 thiserror = { workspace = true }
-sqlx = { version = "0.9", optional = true, default-features = false, features = ["runtime-tokio", "tls-rustls", "chrono", "derive"] }
+sqlx = { version = "0.9", optional = true, default-features = false, features = ["runtime-tokio", "tls-rustls", "chrono", "derive", "mysql-rsa"] }
 
 [features]
 default = ["mysql"]
