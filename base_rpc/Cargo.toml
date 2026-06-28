@@ -8,6 +8,7 @@ rust-version = "1.95"
 base = { path = "../base" }
 thiserror = { workspace = true }
 tonic = { version = "0.14", features = ["transport", "tls-ring", "tls-native-roots"] }
+tokio = { version = "1", features = ["net"] }
 #tower = { version = "0.5", features = ["limit", "timeout", "util"] }
 
 [dev-dependencies]

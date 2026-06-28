@@ -1,4 +1,41 @@
+use std::path::PathBuf;
 use std::time::Duration;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientAuthMode {
+    Disabled,
+    Required,
+    Optional,
+}
+
+#[derive(Debug, Clone)]
+pub struct TlsFileConfig {
+    pub certificate_path: Option<PathBuf>,
+    pub private_key_path: Option<PathBuf>,
+    pub ca_certificate_path: Option<PathBuf>,
+    pub client_certificate_path: Option<PathBuf>,
+    pub client_private_key_path: Option<PathBuf>,
+    pub domain_name: Option<String>,
+    pub use_native_roots: bool,
+    pub client_auth: ClientAuthMode,
+    pub handshake_timeout: Duration,
+}
+
+impl Default for TlsFileConfig {
+    fn default() -> Self {
+        Self {
+            certificate_path: None,
+            private_key_path: None,
+            ca_certificate_path: None,
+            client_certificate_path: None,
+            client_private_key_path: None,
+            domain_name: None,
+            use_native_roots: false,
+            client_auth: ClientAuthMode::Disabled,
+            handshake_timeout: Duration::from_secs(5),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct RpcServerTlsConfig {

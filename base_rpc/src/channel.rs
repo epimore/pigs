@@ -1,7 +1,41 @@
+use std::fs;
+
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
-use crate::config::{RpcChannelConfig, RpcClientTlsConfig};
+use crate::config::{RpcChannelConfig, RpcClientTlsConfig, TlsFileConfig};
 use crate::error::RpcError;
+
+pub fn rpc_scheme(tls_enabled: bool) -> &'static str {
+    if tls_enabled { "grpcs" } else { "grpc" }
+}
+
+pub fn rpc_endpoint_uri(tls_enabled: bool, host: &str, port: u16) -> String {
+    let scheme = if tls_enabled { "https" } else { "http" };
+    format!("{scheme}://{host}:{port}")
+}
+
+pub fn load_client_tls_from_files(config: &TlsFileConfig) -> Result<RpcClientTlsConfig, RpcError> {
+    Ok(RpcClientTlsConfig {
+        domain_name: config.domain_name.clone(),
+        ca_certificate_pem: config
+            .ca_certificate_path
+            .as_ref()
+            .map(fs::read)
+            .transpose()?,
+        client_certificate_pem: config
+            .client_certificate_path
+            .as_ref()
+            .map(fs::read)
+            .transpose()?,
+        client_private_key_pem: config
+            .client_private_key_path
+            .as_ref()
+            .map(fs::read)
+            .transpose()?,
+        use_native_roots: config.use_native_roots,
+        handshake_timeout: config.handshake_timeout,
+    })
+}
 
 pub async fn connect_channel(config: &RpcChannelConfig) -> Result<Channel, RpcError> {
     let mut endpoint = Endpoint::from_shared(config.endpoint.clone())

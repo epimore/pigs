@@ -1,7 +1,41 @@
+use std::fs;
+use std::net::TcpListener as StdTcpListener;
+
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 
-use crate::config::{RpcServerConfig, RpcServerTlsConfig};
+use crate::config::{ClientAuthMode, RpcServerConfig, RpcServerTlsConfig, TlsFileConfig};
 use crate::error::RpcError;
+
+pub fn tcp_incoming_from_std(
+    listener: StdTcpListener,
+) -> Result<tonic::transport::server::TcpIncoming, RpcError> {
+    listener.set_nonblocking(true)?;
+    let listener = tokio::net::TcpListener::from_std(listener)?;
+    Ok(tonic::transport::server::TcpIncoming::from(listener))
+}
+
+pub fn load_server_tls_from_files(config: &TlsFileConfig) -> Result<RpcServerTlsConfig, RpcError> {
+    let certificate_path = config.certificate_path.as_ref().ok_or_else(|| {
+        RpcError::InvalidEndpoint("server TLS certificate_path is required".to_string())
+    })?;
+    let private_key_path = config.private_key_path.as_ref().ok_or_else(|| {
+        RpcError::InvalidEndpoint("server TLS private_key_path is required".to_string())
+    })?;
+    Ok(RpcServerTlsConfig {
+        certificate_pem: fs::read(certificate_path)?,
+        private_key_pem: fs::read(private_key_path)?,
+        client_ca_pem: read_optional(&config.ca_certificate_path)?,
+        client_auth_optional: config.client_auth == ClientAuthMode::Optional,
+        handshake_timeout: config.handshake_timeout,
+    })
+}
+
+fn read_optional(path: &Option<std::path::PathBuf>) -> Result<Option<Vec<u8>>, RpcError> {
+    path.as_ref()
+        .map(fs::read)
+        .transpose()
+        .map_err(RpcError::from)
+}
 
 pub fn build_server(config: &RpcServerConfig) -> Result<Server, RpcError> {
     let mut server = Server::builder()

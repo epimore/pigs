@@ -9,6 +9,8 @@ pub enum RpcError {
     InvalidEndpoint(String),
     #[error("transport error: {0}")]
     Transport(#[from] tonic::transport::Error),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
     #[error("invalid metadata value for {name}: {value}")]
     InvalidMetadata { name: &'static str, value: String },
     #[error("connection task failed: {0}")]
