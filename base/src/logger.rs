@@ -16,12 +16,14 @@ use exception::{GlobalResult, GlobalResultExt};
 ///  ```yaml
 /// log:
 ///   level: warn #全局日志等级 可选：默认 info
+///   stdout: true #是否输出到控制台；可选：默认 true
 ///   prefix: server #全局日志文件前缀; 可选：默认 app 指定生成日志文件添加日期后缀，如 server_2024-10-26.log
 ///   store_path: ./logs #日志文件根目录；可选 默认 当前目录
 ///   specify: #指定日志输出 可选，不指定则默认输出到全局日志里
 ///     - crate_name: test_log::a,test_log::d$  #或者test_log用指全部  必选 以$结束为全路径匹配，精准记录指定日志
-///       level: debug #日志等级 必选
+///       level: debug #日志等级 可选，不指定则使用全局日志等级
 ///       file_name_prefix: a #日志文件前缀 可选 当未指定时，记录到全局日志文件中，等级由指定日志等级控制
+///       stdout: false #独立文件日志是否输出到控制台；可选：默认 true
 ///     - crate_name: test_log::b  #或者test_log用指全部
 ///       level: debug #日志等级
 ///     - crate_name: test_log::c  #或者test_log用指全部
@@ -38,22 +40,33 @@ pub struct Logger {
     #[serde(deserialize_with = "validate_level")]
     #[serde(default = "default_level")]
     level: String,
+    #[serde(default = "default_stdout")]
+    stdout: bool,
     specify: Option<Vec<Specify>>,
 }
 serde_default!(default_prefix, String, "app".to_string());
 serde_default!(default_level, String, "info".to_string());
+serde_default!(default_stdout, bool, true);
 
 #[derive(Debug, Deserialize)]
 pub struct Specify {
     crate_name: String,
-    #[serde(deserialize_with = "validate_level")]
-    level: String,
+    #[serde(default, deserialize_with = "validate_optional_level")]
+    level: Option<String>,
     file_name_prefix: Option<String>,
+    stdout: Option<bool>,
+}
+
+#[derive(Clone, Debug)]
+struct LogRule {
+    targets: Vec<String>,
+    level: Option<LevelFilter>,
 }
 
 impl Logger {
     pub fn init() -> GlobalResult<()> {
         let mut log: Logger = Logger::conf();
+        let default_level = level_filter(&log.level);
 
         // store_path 逻辑
         let store_path = if log.store_path.as_os_str().is_empty() {
@@ -90,16 +103,8 @@ impl Logger {
 
         // 记录所有独立输出的 target，用于主日志排除
         let mut exclude_targets: Vec<String> = Vec::new();
-
-        // 主日志（最后再 chain）
-        let main_logger = fern::Dispatch::new()
-            .format(formatter.clone())
-            .level(level_filter(&log.level)) // 默认等级
-            .chain(std::io::stdout())
-            .chain(fern::DateBased::new(
-                &store_path,
-                format!("{}_{}.log", log.prefix, "%Y-%m-%d"),
-            ));
+        let mut main_rules: Vec<LogRule> = Vec::new();
+        let mut main_max_level = default_level;
 
         // 最终总 dispatch
         let mut dispatch = fern::Dispatch::new();
@@ -107,41 +112,53 @@ impl Logger {
         // 处理 specify
         if let Some(specify) = &log.specify {
             for s in specify {
-                let targets: Vec<String> = s
-                    .crate_name
-                    .split(',')
-                    .map(|t| t.trim().to_string())
-                    .collect();
-
-                let level = level_filter(&s.level);
+                let targets = parse_targets(&s.crate_name);
+                let level = s.level.as_deref().map(level_filter);
+                let effective_level = level.unwrap_or(default_level);
 
                 // case ①：独立文件输出
                 if let Some(file_prefix) = &s.file_name_prefix {
                     exclude_targets.extend(targets.clone());
 
-                    let file_logger = fern::Dispatch::new()
+                    let mut file_logger = fern::Dispatch::new()
                         .format(formatter.clone())
-                        .level(level)
-                        .filter(move |meta| match_target(meta.target(), &targets))
-                        .chain(std::io::stdout())
-                        .chain(fern::DateBased::new(
-                            &store_path,
-                            format!("{}_{}.log", file_prefix, "%Y-%m-%d"),
-                        ));
+                        .level(effective_level)
+                        .filter(move |meta| match_target(meta.target(), &targets));
+
+                    if s.stdout.unwrap_or(true) {
+                        file_logger = file_logger.chain(std::io::stdout());
+                    }
+
+                    file_logger = file_logger.chain(fern::DateBased::new(
+                        &store_path,
+                        format!("{}_{}.log", file_prefix, "%Y-%m-%d"),
+                    ));
 
                     dispatch = dispatch.chain(file_logger);
                 } else {
-                    // case ②：使用主日志，提高等级
-                    for t in targets {
-                        dispatch = dispatch.level_for(t, level);
-                    }
+                    main_max_level = main_max_level.max(effective_level);
+                    main_rules.push(LogRule { targets, level });
                 }
             }
         }
 
         // 主日志排除“独立文件输出”的 targets
-        let main_logger =
-            main_logger.filter(move |meta| !match_target(meta.target(), &exclude_targets));
+        let mut main_logger = fern::Dispatch::new()
+            .format(formatter.clone())
+            .level(main_max_level)
+            .filter(move |meta| {
+                !match_target(meta.target(), &exclude_targets)
+                    && meta.level() <= effective_level(meta.target(), default_level, &main_rules)
+            });
+
+        if log.stdout {
+            main_logger = main_logger.chain(std::io::stdout());
+        }
+
+        main_logger = main_logger.chain(fern::DateBased::new(
+            &store_path,
+            format!("{}_{}.log", log.prefix, "%Y-%m-%d"),
+        ));
 
         dispatch = dispatch.chain(main_logger);
 
@@ -152,6 +169,15 @@ impl Logger {
 
         Ok(())
     }
+}
+
+fn parse_targets(crate_name: &str) -> Vec<String> {
+    crate_name
+        .split(',')
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .map(ToString::to_string)
+        .collect()
 }
 
 fn display_source_file(file: &str) -> Cow<'_, str> {
@@ -177,6 +203,14 @@ fn trim_source_root(file: &str) -> Option<&str> {
     let src = file.rfind("/src/")?;
     let crate_start = file[..src].rfind('/').map_or(0, |index| index + 1);
     Some(&file[crate_start..])
+}
+
+fn effective_level(target: &str, default_level: LevelFilter, rules: &[LogRule]) -> LevelFilter {
+    rules
+        .iter()
+        .find(|rule| match_target(target, &rule.targets))
+        .and_then(|rule| rule.level)
+        .unwrap_or(default_level)
 }
 
 // target 匹配逻辑
@@ -211,9 +245,22 @@ where
     Ok(level)
 }
 
+pub fn validate_optional_level<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let level = Option::<String>::deserialize(deserializer)?;
+    if let Some(level) = &level {
+        level_filter(level);
+    }
+    Ok(level)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::display_source_file;
+    use log::LevelFilter;
+
+    use super::{display_source_file, effective_level, parse_targets, LogRule};
 
     #[test]
     fn shortens_absolute_source_paths() {
@@ -232,6 +279,45 @@ mod tests {
         assert_eq!(
             display_source_file("session/src/http/hook.rs"),
             "session/src/http/hook.rs"
+        );
+    }
+
+    #[test]
+    fn effective_level_uses_global_level_when_no_rule_matches() {
+        let rules = vec![LogRule {
+            targets: parse_targets("app::debug"),
+            level: Some(LevelFilter::Debug),
+        }];
+
+        assert_eq!(
+            effective_level("third_party::noise", LevelFilter::Info, &rules),
+            LevelFilter::Info
+        );
+    }
+
+    #[test]
+    fn effective_level_inherits_global_level_when_rule_has_no_level() {
+        let rules = vec![LogRule {
+            targets: parse_targets("app::default"),
+            level: None,
+        }];
+
+        assert_eq!(
+            effective_level("app::default::module", LevelFilter::Warn, &rules),
+            LevelFilter::Warn
+        );
+    }
+
+    #[test]
+    fn effective_level_uses_specified_level_for_matching_target() {
+        let rules = vec![LogRule {
+            targets: parse_targets("app::verbose"),
+            level: Some(LevelFilter::Debug),
+        }];
+
+        assert_eq!(
+            effective_level("app::verbose::module", LevelFilter::Info, &rules),
+            LevelFilter::Debug
         );
     }
 }
