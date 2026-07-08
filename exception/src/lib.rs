@@ -30,6 +30,29 @@ impl GlobalError {
         op(format_args!("sys err = [{msg}]"));
         Self::SysErr(anyhow::anyhow!("{}", msg))
     }
+
+    pub fn from_external_error<E, O>(error: E, op: O) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+        O: FnOnce(Arguments),
+    {
+        op(format_args!("Trace = [{error:?}]"));
+        Self::SysErr(anyhow::Error::from(error))
+    }
+
+    pub fn from_external_biz_error<E, O>(error: E, code: u16, msg: &str, op: O) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+        O: FnOnce(&str),
+    {
+        op(&format!(
+            "Trace = [code = {code}, msg=\"{msg}\"]; source = [{error:?}]"
+        ));
+        Self::BizErr(BizError {
+            code,
+            msg: msg.to_string(),
+        })
+    }
 }
 
 /// 业务错误结构体
@@ -59,10 +82,7 @@ where
     E: std::error::Error + Send + Sync + 'static,
 {
     fn hand_log<O: FnOnce(Arguments)>(self, op: O) -> GlobalResult<T> {
-        self.map_err(|e| {
-            op(format_args!("Trace = [{e:?}]"));
-            GlobalError::SysErr(anyhow::Error::from(e))
-        })
+        self.map_err(|e| GlobalError::from_external_error(e, op))
     }
 
     fn hand_log_str<O: FnOnce(&str)>(self, op: O) -> GlobalResult<T> {
@@ -73,15 +93,7 @@ where
     }
 
     fn hand_biz_log<O: FnOnce(&str)>(self, code: u16, msg: &str, op: O) -> GlobalResult<T> {
-        self.map_err(|e| {
-            op(&format!(
-                "Trace = [code = {code}, msg=\"{msg}\"]; source = [{e:?}]"
-            ));
-            GlobalError::BizErr(BizError {
-                code,
-                msg: msg.to_string(),
-            })
-        })
+        self.map_err(|e| GlobalError::from_external_biz_error(e, code, msg, op))
     }
 }
 
@@ -89,4 +101,36 @@ pub trait GlobalResultExt<T> {
     fn hand_log<O: FnOnce(std::fmt::Arguments)>(self, op: O) -> GlobalResult<T>;
     fn hand_log_str<O: FnOnce(&str)>(self, op: O) -> GlobalResult<T>;
     fn hand_biz_log<O: FnOnce(&str)>(self, code: u16, msg: &str, op: O) -> GlobalResult<T>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn external_error_conversion_logs_once_at_conversion_point() {
+        let mut log_count = 0;
+        let error = std::io::Error::other("network down");
+        let converted = GlobalError::from_external_error(error, |_| log_count += 1);
+
+        assert_eq!(log_count, 1);
+        assert!(matches!(converted, GlobalError::SysErr(_)));
+    }
+
+    #[test]
+    fn external_biz_conversion_keeps_code_and_message() {
+        let mut log_count = 0;
+        let error = std::io::Error::other("node rejected");
+        let converted =
+            GlobalError::from_external_biz_error(error, 3202, "node rpc timeout", |_| {
+                log_count += 1
+            });
+
+        assert_eq!(log_count, 1);
+        let GlobalError::BizErr(BizError { code, msg }) = converted else {
+            panic!("expected biz error");
+        };
+        assert_eq!(code, 3202);
+        assert_eq!(msg, "node rpc timeout");
+    }
 }

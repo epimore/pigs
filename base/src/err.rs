@@ -1,17 +1,42 @@
 use dashmap::DashMap;
 use exception::{BizError, GlobalError};
-use log::error;
 use once_cell::sync::Lazy;
 use std::borrow::Cow;
 
+const FALLBACK_USER_MESSAGE: &str = "系统繁忙！请稍后重试。";
+
+#[derive(Debug, Clone)]
+pub struct ErrorOutput {
+    pub code: u16,
+    pub code_name: Cow<'static, str>,
+    pub user_message: Cow<'static, str>,
+    pub retryable: bool,
+}
+
+impl ErrorOutput {
+    pub fn new(
+        code: u16,
+        code_name: impl Into<Cow<'static, str>>,
+        user_message: impl Into<Cow<'static, str>>,
+        retryable: bool,
+    ) -> Self {
+        Self {
+            code,
+            code_name: code_name.into(),
+            user_message: user_message.into(),
+            retryable,
+        }
+    }
+}
+
 pub struct ErrorRegistration {
-    pub register: fn(&DashMap<u16, Cow<'static, str>>),
+    pub register: fn(&DashMap<u16, ErrorOutput>),
 }
 
 inventory::collect!(ErrorRegistration);
 
 //code: out_msg
-static REGISTRY: Lazy<DashMap<u16, Cow<'static, str>>> = Lazy::new(|| {
+static REGISTRY: Lazy<DashMap<u16, ErrorOutput>> = Lazy::new(|| {
     let map = DashMap::new();
     for reg in inventory::iter::<ErrorRegistration> {
         (reg.register)(&map);
@@ -22,20 +47,30 @@ static REGISTRY: Lazy<DashMap<u16, Cow<'static, str>>> = Lazy::new(|| {
 pub trait CodeOutErr {
     fn out_err(&self) -> Cow<'static, str>;
 }
-impl CodeOutErr for GlobalError {
-    fn out_err(&self) -> Cow<'static, str> {
-        match self {
-            GlobalError::BizErr(BizError { code, msg }) => match REGISTRY.get(code) {
-                None => {
-                    error!("Out error [BIZ]: {}", msg);
-                    Cow::Borrowed("系统繁忙！请稍后重试。")
-                }
-                Some(e) => e.clone(),
-            },
-            GlobalError::SysErr(e) => {
-                error!("Out error [SYSTEM]: {}", e);
-                Cow::Borrowed("系统繁忙！请稍后重试。")
-            }
+
+pub fn error_output(code: u16) -> Option<ErrorOutput> {
+    REGISTRY.get(&code).map(|item| item.clone())
+}
+
+pub fn global_error_output(error: &GlobalError) -> ErrorOutput {
+    match error {
+        GlobalError::BizErr(BizError { code, .. }) => error_output(*code).unwrap_or_else(|| {
+            ErrorOutput::new(
+                *code,
+                Cow::Borrowed("Unregistered"),
+                Cow::Borrowed(FALLBACK_USER_MESSAGE),
+                false,
+            )
+        }),
+        GlobalError::SysErr(_) => {
+            error_output(BaseErrorCode::Internal.code()).unwrap_or_else(|| {
+                ErrorOutput::new(
+                    BaseErrorCode::Internal.code(),
+                    Cow::Borrowed("Internal"),
+                    Cow::Borrowed(FALLBACK_USER_MESSAGE),
+                    false,
+                )
+            })
         }
     }
 }
@@ -48,7 +83,7 @@ impl CodeOutErr for GlobalError {
 macro_rules! define_errors {
     (
         $enum_name:ident {
-            $($name:ident => ($code:expr, $out:expr)),* $(,)?
+            $($name:ident => ($code:expr, $out:expr $(, $($meta:tt)+)?)),* $(,)?
         }
     ) => {
         #[derive(Debug, Clone, Copy)]
@@ -69,6 +104,38 @@ macro_rules! define_errors {
                     $(Self::$name => $out),*
                 }
             }
+
+            #[inline]
+            pub fn code_name(self) -> &'static str {
+                match self {
+                    $(Self::$name => stringify!($name)),*
+                }
+            }
+
+            #[inline]
+            pub fn retryable(self) -> bool {
+                match self {
+                    $(Self::$name => $crate::__error_retryable!($($($meta)+)?)),*
+                }
+            }
+
+            #[inline]
+            pub fn output(self) -> $crate::err::ErrorOutput {
+                $crate::err::ErrorOutput::new(
+                    self.code(),
+                    self.code_name(),
+                    self.out_msg(),
+                    self.retryable(),
+                )
+            }
+
+            #[inline]
+            pub fn from_code(code: u16) -> Option<Self> {
+                match code {
+                    $($code => Some(Self::$name),)*
+                    _ => None,
+                }
+            }
         }
 
         // compile-time 冲突检测:同 crate 强校验
@@ -83,13 +150,19 @@ macro_rules! define_errors {
         $crate::paste::paste! {
             #[allow(non_snake_case)]
             fn [<__register_ $enum_name>](
-                map: &dashmap::DashMap<u16, std::borrow::Cow<'static, str>>
+                map: &$crate::dashmap::DashMap<u16, $crate::err::ErrorOutput>
             ) {
                 $(
-                    if let Some(old) = map.insert($code, std::borrow::Cow::Borrowed($out)) {
-                        log::warn!(
+                    let output = $crate::err::ErrorOutput::new(
+                        $code,
+                        stringify!($name),
+                        std::borrow::Cow::Borrowed($out),
+                        $crate::__error_retryable!($($($meta)+)?),
+                    );
+                    if let Some(old) = map.insert($code, output) {
+                        $crate::log::warn!(
                             "Err replaced; code={}, old={}, new={}",
-                            $code, old, $out
+                            $code, old.user_message, $out
                         );
                     }
                 )*
@@ -104,6 +177,17 @@ macro_rules! define_errors {
     };
 }
 
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __error_retryable {
+    () => {
+        false
+    };
+    (retryable = $retryable:expr) => {
+        $retryable
+    };
+}
+
 define_errors! {
     BaseErrorCode {
         NotFound => (1140, "请求的资源不存在或已被删除。"),
@@ -113,25 +197,44 @@ define_errors! {
         PermissionDenied => (1180, "用户操作权限不足。"),
         InvalidState => (1190, "数据校验失败！请检查输入。"),
         Unsupported => (1200, "系统暂不支持！敬请期待。"),
-        Timeout => (1210, "设备响应超时或网络异常！请稍后重试。"),
-        Network => (1220, "网络异常！请稍后重试。"),
-        IoBusy => (1230, "系统繁忙！请稍后重试。"),
+        Timeout => (1210, "设备响应超时或网络异常！请稍后重试。", retryable = true),
+        Network => (1220, "网络异常！请稍后重试。", retryable = true),
+        IoBusy => (1230, "系统繁忙！请稍后重试。", retryable = true),
         Internal => (1240, "系统繁忙！请稍后重试。"),
     }
 }
 
+impl CodeOutErr for GlobalError {
+    fn out_err(&self) -> Cow<'static, str> {
+        global_error_output(self).user_message
+    }
+}
+
 #[test]
-fn test_err_out() {
+fn registered_biz_error_returns_registered_output() {
     let cow = GlobalError::BizErr(BizError {
         code: 1140,
         msg: "aaaa".to_string(),
     })
     .out_err();
-    println!("{}", cow);
+    assert_eq!(cow, "请求的资源不存在或已被删除。");
+}
+
+#[test]
+fn unregistered_biz_error_returns_fallback_without_logging() {
     let cow = GlobalError::BizErr(BizError {
         code: 11950,
         msg: "aaaa".to_string(),
     })
     .out_err();
-    println!("{}", cow);
+    assert_eq!(cow, FALLBACK_USER_MESSAGE);
+}
+
+#[test]
+fn error_output_includes_metadata() {
+    let output = BaseErrorCode::Timeout.output();
+    assert_eq!(output.code, 1210);
+    assert_eq!(output.code_name, "Timeout");
+    assert_eq!(output.user_message, "设备响应超时或网络异常！请稍后重试。");
+    assert!(output.retryable);
 }
