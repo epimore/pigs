@@ -10,6 +10,8 @@ use crate::serde_default;
 use cfg_lib::conf;
 use exception::{GlobalResult, GlobalResultExt};
 
+pub mod episode;
+
 /// 通过配置文件控制日志格式化输出
 /// # Examples
 ///
