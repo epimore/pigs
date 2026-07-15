@@ -1,5 +1,4 @@
 use base::bus::mpsc::TypedMessageBus;
-use exception::typed::common::MessageBusError;
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -16,7 +15,10 @@ async fn main() {
     });
     tokio::spawn(async move {
         if let Ok(msg) = user_receiver.recv().await {
-            println!("[user] received: {:?}", msg);
+            println!(
+                "[user] received: name={}, age={}, sex={}",
+                msg.name, msg.age, msg.sex
+            );
         }
     });
     tokio::spawn(async move {
@@ -29,7 +31,7 @@ async fn main() {
             }
         }
     });
-    assert_eq!(bus.publish(42_u32).await.is_err(), true);
+    assert!(bus.publish(42_u32).await.is_err());
     bus.publish("aaaa".to_string())
         .await
         .expect("TODO: panic message");
@@ -49,7 +51,7 @@ async fn main() {
         }
     }
 
-    assert_eq!(bus.publish(12i8).await.is_err(), true);
+    assert!(bus.publish(12i8).await.is_err());
     sleep(Duration::from_secs(2)).await;
     let mut i8_receiver = bus.sub_type_channel::<i8>().unwrap();
     if let Ok(msg) = i8_receiver.recv_with_timeout(Duration::from_secs(1)).await {

@@ -15,6 +15,12 @@ pub struct TypedMessageBus {
     channels: Arc<DashMap<TypeId, mpsc::Sender<Box<dyn Any + Send + Sync>>>>,
 }
 
+impl Default for TypedMessageBus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TypedMessageBus {
     pub fn new() -> Self {
         Self {

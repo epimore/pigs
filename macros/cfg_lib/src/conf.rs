@@ -8,9 +8,9 @@ use clap::{Arg, ArgAction, ArgMatches, Command};
 use once_cell::sync::{Lazy, OnceCell};
 
 static CONF: OnceCell<Arc<String>> = OnceCell::new();
-static INSTANCES: Lazy<
-    Mutex<HashMap<String, Box<dyn Fn() -> Result<(), FieldCheckError> + Send>>>,
-> = Lazy::new(|| Mutex::new(HashMap::new()));
+type ConfigValidator = Box<dyn Fn() -> Result<(), FieldCheckError> + Send>;
+static INSTANCES: Lazy<Mutex<HashMap<String, ConfigValidator>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug)]
 pub enum FieldCheckError {
@@ -63,7 +63,7 @@ pub fn init_cfg(path: String) {
             err_msg.push_str(&format!("{}: {}\n", name, err).to_string());
         }
     }
-    if err_msg.len() > 0 {
+    if !err_msg.is_empty() {
         eprintln!("ERR: {}", err_msg);
         eprintln!("   ...init service config failed.\n      ...start service failed.");
         std::process::exit(1);

@@ -15,7 +15,7 @@ use syn::{Data, DeriveInput, Fields};
 /// - `lib`: use external crate path, empty means current crate.
 /// - `check`: run `CheckFromConf::_field_check`.
 /// - `default`: enabled by default; It is only disabled when default = "false".
-///    Use #[serde(default = "...")] or #[serde(default)] to set default value for a field.
+///   Use `#[serde(default = "...")]` or `#[serde(default)]` to set a field default.
 #[proc_macro_attribute]
 pub fn conf(attrs: TokenStream, item: TokenStream) -> TokenStream {
     let ast: DeriveInput = syn::parse(item).expect("syn parse item failed");

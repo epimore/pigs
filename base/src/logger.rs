@@ -123,7 +123,7 @@ impl Logger {
                     exclude_targets.extend(targets.clone());
 
                     let mut file_logger = fern::Dispatch::new()
-                        .format(formatter.clone())
+                        .format(formatter)
                         .level(effective_level)
                         .filter(move |meta| match_target(meta.target(), &targets));
 
@@ -146,7 +146,7 @@ impl Logger {
 
         // 主日志排除“独立文件输出”的 targets
         let mut main_logger = fern::Dispatch::new()
-            .format(formatter.clone())
+            .format(formatter)
             .level(main_max_level)
             .filter(move |meta| {
                 !match_target(meta.target(), &exclude_targets)
@@ -243,7 +243,7 @@ where
     D: Deserializer<'de>,
 {
     let level = String::deserialize(deserializer)?;
-    level_filter(&*level);
+    level_filter(&level);
     Ok(level)
 }
 

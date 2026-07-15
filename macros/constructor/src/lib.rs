@@ -299,7 +299,7 @@ fn build_named_set_constructor(
     constructor
 }
 
-fn parse_args<T: Parse>(attrs: &Vec<Attribute>, ident: &str) -> Option<Punctuated<T, Comma>> {
+fn parse_args<T: Parse>(attrs: &[Attribute], ident: &str) -> Option<Punctuated<T, Comma>> {
     if let Some(attr) = attrs.iter().find(|attr| attr.path().is_ident(ident)) {
         match &attr.meta {
             Meta::Path(_) => {

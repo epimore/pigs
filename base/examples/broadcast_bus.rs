@@ -27,7 +27,10 @@ async fn main() {
     let mut sub_user1 = bus.sub_type_channel::<User>();
     tokio::spawn(async move {
         while let Ok(user) = sub_user.recv().await {
-            println!("[User] received: {:?}", user);
+            println!(
+                "[User] received: name={}, age={}, sex={}",
+                user.name, user.age, user.sex
+            );
         }
     });
 
@@ -42,7 +45,10 @@ async fn main() {
     })
     .expect("TODO: panic message");
     if let Ok(user) = sub_user1.try_recv() {
-        println!("[User1] received: {:?}", user);
+        println!(
+            "[User1] received: name={}, age={}, sex={}",
+            user.name, user.age, user.sex
+        );
     }
     sleep(Duration::from_secs(2)).await;
     println!("Done.");

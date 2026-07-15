@@ -45,9 +45,7 @@ impl DaemonMeta {
 
     fn load_meta() -> Self {
         let meta_path = Self::get_meta_file_path();
-        let content = fs::read_to_string(meta_path)
-            .ok()
-            .expect("Failed to read meta file");
+        let content = fs::read_to_string(meta_path).expect("Failed to read meta file");
         serde_json::from_str(&content).expect("Failed to deserialize meta")
     }
 }

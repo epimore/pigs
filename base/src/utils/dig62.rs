@@ -73,7 +73,7 @@ pub fn de(num62: &str) -> GlobalResult<String> {
         let mut circle = 0;
         let a_ch;
 
-        if chars[i].is_digit(10) {
+        if chars[i].is_ascii_digit() {
             circle = *d_dic_map.get(&chars[i]).ok_or_else(|| {
                 GlobalError::new_sys_error("Illegal digit character", |msg| error!("{msg}"))
             })?;

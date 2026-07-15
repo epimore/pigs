@@ -18,17 +18,9 @@ pub enum ConnectionState {
     Stopped,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct StreamSupervisorConfig {
     pub retry: RetryPolicy,
-}
-
-impl Default for StreamSupervisorConfig {
-    fn default() -> Self {
-        Self {
-            retry: RetryPolicy::default(),
-        }
-    }
 }
 
 #[derive(Clone)]

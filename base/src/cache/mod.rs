@@ -256,14 +256,6 @@ mod tests {
         fn get_id(&self) -> &str {
             &self.id
         }
-
-        fn was_expire_called(&self) -> bool {
-            self.expire_called.load(Ordering::SeqCst)
-        }
-
-        fn get_expire_call_count(&self) -> usize {
-            self.expire_call_count.load(Ordering::SeqCst)
-        }
     }
 
     impl Cacheable for MockCacheable {
@@ -344,8 +336,6 @@ mod tests {
         let cache = Cache::init();
         let key = "expire_key".to_string();
         let mock = MockCacheable::new("expire_test", Some(Duration::from_millis(100)));
-        let expire_call_count = Arc::new(AtomicUsize::new(0));
-
         // 包装 mock 以便共享计数器
         let value = CachedValue(Arc::new(mock));
 
@@ -713,21 +703,6 @@ mod tests {
         for handle in handles {
             handle.await.unwrap();
         }
-    }
-
-    // 测试 CommonCache 的使用
-    #[tokio::test]
-    async fn test_common_cache() {
-        // 注意：这里假设 CommonCache 的方法已经被修复为不带 &self 参数
-        // 如果还没修复，这个测试会编译失败
-        let key = "common_key".to_string();
-        let mock = MockCacheable::new("common", Some(Duration::from_secs(60)));
-        let value = CachedValue(Arc::new(mock));
-
-        // 这些调用需要根据 CommonCache 的实际 API 调整
-        // CommonCache::insert(key.clone(), value).await;
-        // let retrieved = CommonCache::get(&key);
-        // assert!(retrieved.is_some());
     }
 
     // 测试重复插入相同 key

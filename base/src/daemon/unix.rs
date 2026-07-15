@@ -58,7 +58,7 @@ pub(super) fn status_service() {
                 // === 获取并格式化启动时间为 YYYY-MM-DD HH:MM:SS ===
                 let mut printed_start_time = false;
                 if let Ok(output) = Command::new("ps")
-                    .args(&["-p", &pid.to_string(), "-o", "lstart="])
+                    .args(["-p", &pid.to_string(), "-o", "lstart="])
                     .output()
                 {
                     if output.status.success() {
@@ -80,7 +80,7 @@ pub(super) fn status_service() {
                 // 如果解析失败，回退到原始输出（保持兼容）
                 if !printed_start_time {
                     if let Ok(output) = Command::new("ps")
-                        .args(&["-p", &pid.to_string(), "-o", "lstart="])
+                        .args(["-p", &pid.to_string(), "-o", "lstart="])
                         .output()
                     {
                         if let Ok(raw) = String::from_utf8(output.stdout) {
@@ -130,7 +130,7 @@ fn format_start_time_friendly(s: &str) -> Result<String, Box<dyn std::error::Err
     ];
     let mut parsed_datetime = None;
     for format in &formats {
-        if let Ok(dt) = DateTime::parse_from_str(&s, format) {
+        if let Ok(dt) = DateTime::parse_from_str(s, format) {
             parsed_datetime = Some(dt);
             break;
         }
@@ -285,15 +285,16 @@ fn send_terminate_signal(pid: i32) -> Result<(), std::io::Error> {
         .arg("-TERM")
         .arg(pid.to_string())
         .status()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("exec kill: {}", e)))?;
+        .map_err(|e| std::io::Error::other(format!("exec kill: {}", e)))?;
 
     if status.success() {
         Ok(())
     } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("kill -TERM {} failed (exit code: {:?})", pid, status.code()),
-        ))
+        Err(std::io::Error::other(format!(
+            "kill -TERM {} failed (exit code: {:?})",
+            pid,
+            status.code()
+        )))
     }
 }
 

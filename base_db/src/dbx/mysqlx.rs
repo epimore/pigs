@@ -14,10 +14,10 @@ use base::{logger, serde_default};
 
 use crate::dbx::DatabasePoolConfig;
 use crate::DatabaseError;
-static MYSQL_POOL: LazyLock<Pool<MySql>> = LazyLock::new(|| DbModel::build_pool_conn());
+static MYSQL_POOL: LazyLock<Pool<MySql>> = LazyLock::new(DbModel::build_pool_conn);
 
 pub fn get_conn_by_pool() -> &'static Pool<MySql> {
-    &*MYSQL_POOL
+    &MYSQL_POOL
 }
 
 #[derive(Debug, Deserialize)]

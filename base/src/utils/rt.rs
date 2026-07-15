@@ -10,13 +10,14 @@ use tokio::runtime::{Handle, Runtime};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
-///协议类型	      推荐线程数	运行时类型	理由
-///HTTP API	      2-4	    多线程	    短连接，高并发，I/O等待多
-///WebSocket	  4-8	    多线程	    长连接，状态维护，中等并发
-///TCP Server	  6-12	    多线程	    重量级连接，复杂协议处理
-///UDP Service	  1	        当前线程     无连接，高吞吐，单线程高效
-///RPC Service	  4-8	    多线程	    中等负载，序列化开销
-///Proxy Service  8+	    多线程	    高吞吐，数据转发
+/// | 协议类型 | 推荐线程数 | 运行时类型 | 理由 |
+/// | --- | --- | --- | --- |
+/// | HTTP API | 2-4 | 多线程 | 短连接，高并发，I/O 等待多 |
+/// | WebSocket | 4-8 | 多线程 | 长连接，状态维护，中等并发 |
+/// | TCP Server | 6-12 | 多线程 | 重量级连接，复杂协议处理 |
+/// | UDP Service | 1 | 当前线程 | 无连接，高吞吐，单线程高效 |
+/// | RPC Service | 4-8 | 多线程 | 中等负载，序列化开销 |
+/// | Proxy Service | 8+ | 多线程 | 高吞吐，数据转发 |
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RuntimeType {
@@ -161,7 +162,9 @@ impl GlobalRuntime {
     async fn shutdown(orders: &[RuntimeType]) -> Runtime {
         Signal::wait_exit_signal().await;
         orders.iter().for_each(|rt_type| {
-            Self::get_runtime(rt_type).map(|Self { cancel, .. }| cancel.cancel());
+            if let Some(Self { cancel, .. }) = Self::get_runtime(rt_type) {
+                cancel.cancel();
+            }
         });
         let (_, (main_rt, cancel)) = GLOBAL_RUNTIMES.remove(&RuntimeType::Main).unwrap();
         cancel.cancel();

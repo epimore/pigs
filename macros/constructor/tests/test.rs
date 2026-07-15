@@ -48,7 +48,7 @@ fn test_bar() {
     bar.set_b("nb");
     bar.set_c(false);
     assert_eq!(bar.get_b(), &"nb".to_string());
-    assert_eq!(*bar.get_c(), false);
+    assert!(!(*bar.get_c()));
 }
 
 #[derive(Set, Get, New, Default, Debug, PartialEq)]

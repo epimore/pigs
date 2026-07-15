@@ -3,7 +3,7 @@
 #[cfg(target_os = "linux")]
 use std::fs;
 use std::io;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[cfg(not(target_os = "linux"))]
 use sysinfo::{Networks, ProcessesToUpdate, System, get_current_pid};
@@ -75,10 +75,16 @@ impl HostMetricsCollector {
         }
     }
 
+    /// Samples the current host metrics.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when a required Linux procfs metric cannot be read
+    /// or parsed.
     pub fn sample(&mut self) -> io::Result<HostMetrics> {
         #[cfg(target_os = "linux")]
         {
-            sample_from(ProcReader, &mut self.previous)
+            sample_from(&ProcReader, &mut self.previous)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -109,13 +115,12 @@ impl MetricsReader for ProcReader {
 
 #[cfg(target_os = "linux")]
 fn sample_from(
-    reader: impl MetricsReader,
+    reader: &impl MetricsReader,
     previous: &mut Option<(Instant, Counters)>,
 ) -> io::Result<HostMetrics> {
     let now = Instant::now();
     let (cpu_total, cpu_idle) = parse_cpu(&reader.read("/proc/stat")?)?;
-    let (load_average_1m, load_average_5m, load_average_15m) =
-        parse_load(&reader.read("/proc/loadavg")?)?;
+    let load_average = parse_load(&reader.read("/proc/loadavg")?)?;
     let memory = parse_memory(&reader.read("/proc/meminfo")?);
     let (disk_read_bytes, disk_write_bytes) = parse_disk(&reader.read("/proc/diskstats")?);
     let (network_receive_bytes, network_transmit_bytes) =
@@ -131,9 +136,9 @@ fn sample_from(
         network_transmit_bytes,
     };
     let mut metrics = HostMetrics {
-        load_average_1m,
-        load_average_5m,
-        load_average_15m,
+        load_average_1m: load_average.0,
+        load_average_5m: load_average.1,
+        load_average_15m: load_average.2,
         memory_total_bytes: memory.0,
         memory_used_bytes: memory.0.saturating_sub(memory.1),
         swap_total_bytes: memory.2,
@@ -143,13 +148,17 @@ fn sample_from(
         ..HostMetrics::default()
     };
     if let Some((previous_at, before)) = previous {
-        let elapsed = now.duration_since(*previous_at).as_secs_f64();
-        if elapsed > 0.0 {
+        let elapsed = now.duration_since(*previous_at);
+        if !elapsed.is_zero() {
             let total_delta = current.cpu_total.saturating_sub(before.cpu_total);
             let idle_delta = current.cpu_idle.saturating_sub(before.cpu_idle);
-            if total_delta > 0 {
+            if let Some(busy_basis_points) = total_delta
+                .saturating_sub(idle_delta)
+                .saturating_mul(10_000)
+                .checked_div(total_delta)
+            {
                 metrics.cpu_usage_percent =
-                    100.0 * (total_delta.saturating_sub(idle_delta)) as f64 / total_delta as f64;
+                    f64::from(u32::try_from(busy_basis_points).unwrap_or(10_000)) / 100.0;
             }
             metrics.disk_read_bytes_per_sec =
                 rate(current.disk_read_bytes, before.disk_read_bytes, elapsed);
@@ -220,8 +229,8 @@ fn sample_from_sysinfo(
         ..Counters::default()
     };
     if let Some((previous_at, before)) = previous {
-        let elapsed = now.duration_since(*previous_at).as_secs_f64();
-        if elapsed > 0.0 {
+        let elapsed = now.duration_since(*previous_at);
+        if !elapsed.is_zero() {
             metrics.network_receive_bytes_per_sec = rate(
                 current.network_receive_bytes,
                 before.network_receive_bytes,
@@ -238,8 +247,18 @@ fn sample_from_sysinfo(
     metrics
 }
 
-fn rate(current: u64, previous: u64, elapsed: f64) -> u64 {
-    (current.saturating_sub(previous) as f64 / elapsed).round() as u64
+fn rate(current: u64, previous: u64, elapsed: Duration) -> u64 {
+    let elapsed_nanos = elapsed.as_nanos();
+    if elapsed_nanos == 0 {
+        return 0;
+    }
+
+    let bytes = u128::from(current.saturating_sub(previous));
+    let per_second = bytes
+        .saturating_mul(1_000_000_000)
+        .saturating_add(elapsed_nanos / 2)
+        / elapsed_nanos;
+    u64::try_from(per_second).unwrap_or(u64::MAX)
 }
 
 #[cfg(target_os = "linux")]
@@ -362,6 +381,13 @@ fn parse_process(input: &str) -> (u64, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn calculates_rounded_integer_rate_without_float_conversion() {
+        assert_eq!(rate(1_500, 500, Duration::from_secs(2)), 500);
+        assert_eq!(rate(2, 0, Duration::from_secs(3)), 1);
+        assert_eq!(rate(2, 1, Duration::ZERO), 0);
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

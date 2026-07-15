@@ -326,9 +326,9 @@ impl<K: CacheKey> Shard<K> {
         while self.tick < target {
             self.tick += 1;
 
-            if self.tick % WHEEL_L1 as u64 == 0 {
+            if self.tick.is_multiple_of(WHEEL_L1 as u64) {
                 self.cascade_l2();
-                if (self.tick / WHEEL_L1 as u64) % WHEEL_L2 as u64 == 0 {
+                if (self.tick / WHEEL_L1 as u64).is_multiple_of(WHEEL_L2 as u64) {
                     self.cascade_l3();
                 }
             }
@@ -464,7 +464,7 @@ impl<K: CacheKey> Cache<K> {
         if ms == 0 {
             1
         } else {
-            (ms + TICK_MS - 1) / TICK_MS
+            ms.div_ceil(TICK_MS)
         }
     }
     pub fn insert(&self, key: K, ttl: Duration) -> GlobalResult<()> {
@@ -502,7 +502,8 @@ mod tests {
     #[tokio::test]
     async fn test_expire() {
         let c = Cache::default();
-        c.insert("a".to_string(), Duration::from_millis(2000));
+        c.insert("a".to_string(), Duration::from_millis(2000))
+            .expect("insert a");
         assert!(timeout(Duration::from_millis(1000), c.next_batch())
             .await
             .is_err());
@@ -517,9 +518,12 @@ mod tests {
     async fn test_refresh() {
         let c = Cache::default();
 
-        c.insert("a".to_string(), Duration::from_millis(500));
-        c.insert("b".to_string(), Duration::from_millis(1200));
-        c.insert("c".to_string(), Duration::from_millis(1200));
+        c.insert("a".to_string(), Duration::from_millis(500))
+            .expect("insert a");
+        c.insert("b".to_string(), Duration::from_millis(1200))
+            .expect("insert b");
+        c.insert("c".to_string(), Duration::from_millis(1200))
+            .expect("insert c");
 
         sleep(Duration::from_millis(1000)).await;
         assert_eq!(
@@ -531,7 +535,7 @@ mod tests {
             "a".to_string()
         );
 
-        c.refresh("b".to_string());
+        c.refresh("b".to_string()).expect("refresh b");
         sleep(Duration::from_millis(800)).await;
         assert_eq!(
             timeout(Duration::from_millis(100), c.next_batch())
@@ -559,7 +563,8 @@ mod tests {
     async fn test_long_ttl() {
         let c = Cache::default();
 
-        c.insert("b".to_string(), Duration::from_secs(2));
+        c.insert("b".to_string(), Duration::from_secs(2))
+            .expect("insert b");
 
         sleep(Duration::from_secs(3)).await;
 
@@ -571,8 +576,10 @@ mod tests {
     async fn test_delete() {
         let cache = Cache::<String>::default();
 
-        cache.insert("dead".to_string(), Duration::from_secs(1));
-        cache.delete("dead".to_string());
+        cache
+            .insert("dead".to_string(), Duration::from_secs(1))
+            .expect("insert dead");
+        cache.delete("dead".to_string()).expect("delete dead");
 
         let r = timeout(Duration::from_millis(1200), cache.next_batch()).await;
         assert!(r.is_err());
@@ -584,15 +591,25 @@ mod tests {
         Stream(u64),
         Device(String),
     }
-    pub static TTL_CACHE: Lazy<Cache<ExpireKey>> = Lazy::new(|| Cache::default());
+    pub static TTL_CACHE: Lazy<Cache<ExpireKey>> = Lazy::new(Cache::default);
     #[tokio::test]
     async fn single_instance() {
-        TTL_CACHE.insert(ExpireKey::Session(123), Duration::from_secs(2));
-        TTL_CACHE.insert(ExpireKey::Stream(456), Duration::from_secs(2));
-        TTL_CACHE.insert(ExpireKey::Device("abc".to_string()), Duration::from_secs(2));
+        TTL_CACHE
+            .insert(ExpireKey::Session(123), Duration::from_secs(2))
+            .expect("insert session");
+        TTL_CACHE
+            .insert(ExpireKey::Stream(456), Duration::from_secs(2))
+            .expect("insert stream");
+        TTL_CACHE
+            .insert(ExpireKey::Device("abc".to_string()), Duration::from_secs(2))
+            .expect("insert device");
         sleep(Duration::from_secs(1)).await;
-        TTL_CACHE.delete(ExpireKey::Stream(456));
-        TTL_CACHE.refresh(ExpireKey::Device("abc".to_string()));
+        TTL_CACHE
+            .delete(ExpireKey::Stream(456))
+            .expect("delete stream");
+        TTL_CACHE
+            .refresh(ExpireKey::Device("abc".to_string()))
+            .expect("refresh device");
         assert!(timeout(Duration::from_secs(5), async {
             loop {
                 if let Some(batch) = TTL_CACHE.next_batch().await {
@@ -610,8 +627,10 @@ mod tests {
     async fn test_duplicate_insert_overwrite() {
         let c = Cache::default();
 
-        c.insert("dup".to_string(), Duration::from_millis(500));
-        c.insert("dup".to_string(), Duration::from_millis(1200));
+        c.insert("dup".to_string(), Duration::from_millis(500))
+            .expect("insert first dup");
+        c.insert("dup".to_string(), Duration::from_millis(1200))
+            .expect("overwrite dup");
 
         // 600ms 后不应过期（第一次已被覆盖）
         tokio::time::sleep(Duration::from_millis(600)).await;
