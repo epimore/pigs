@@ -90,7 +90,7 @@ impl Cache {
         let purge_shared = shared.clone();
         let rt = GlobalRuntime::get_main_runtime();
         let cancellation_token_cmd = rt.cancel.clone();
-        rt.rt_handle.spawn(async move {
+        rt.spawn("cache-delay-queue", async move {
             let mut delay_queue = DelayQueue::<String>::new();
             let mut key_map = HashMap::<String, Key>::new();
             loop {
@@ -142,11 +142,12 @@ impl Cache {
             key_map.clear();
             purge_shared.map.clear();
             delay_queue.clear();
-        });
+        })
+        .expect("spawn cache delay queue");
 
         // spawn async expire_call worker
-        let cancellation_token_call = rt.cancel;
-        rt.rt_handle.spawn(async move {
+        let cancellation_token_call = rt.cancel.clone();
+        rt.spawn("cache-expire-callback", async move {
             let semaphore = Arc::new(Semaphore::new(100));
             loop {
                 tokio::select! {
@@ -166,7 +167,8 @@ impl Cache {
                     }
                 }
             }
-        });
+        })
+        .expect("spawn cache expire callback");
         Cache { shared }
     }
 }

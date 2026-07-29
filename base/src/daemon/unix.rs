@@ -1,4 +1,5 @@
 use crate::daemon::Daemon;
+use crate::utils::rt::DAEMON_STOP_TIMEOUT_SECS;
 use chrono::{DateTime, NaiveDateTime};
 use daemonize::{Daemonize, Outcome};
 use std::fs::File;
@@ -236,9 +237,8 @@ pub(super) fn stop_service() -> bool {
         return false;
     }
 
-    // 等待优雅退出（最多 10 秒）
-    if wait_for_process_exit(pid, 10) {
-        println!("Service stopped gracefully.");
+    if wait_for_process_exit(pid, DAEMON_STOP_TIMEOUT_SECS) {
+        println!("Service stopped after SIGTERM.");
         remove_pid_file();
         return true;
     }
