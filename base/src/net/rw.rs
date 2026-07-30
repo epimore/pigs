@@ -1,4 +1,5 @@
 use crate::net::state::Protocol;
+use crate::utils::rt::GlobalRuntime;
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use exception::{GlobalError, GlobalResult, GlobalResultExt};
@@ -10,9 +11,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::select;
-use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 pub trait PacketDispatcher: Send + Sync + 'static {
@@ -294,15 +295,22 @@ where
     pub async fn write(&self, data: Bytes) -> GlobalResult<()> {
         if self.cancel.is_cancelled() {
             return Err(GlobalError::new_sys_error("tcp sink is closed", |msg| {
-                error!("{msg}: remote_addr={}", self.remote_addr)
+                debug!("{msg}: remote_addr={}", self.remote_addr)
             }));
         }
         let packet = self.encoder.encode_tcp(data)?;
-        self.sender.send(packet).await.map_err(|_| {
-            GlobalError::new_sys_error("tcp write channel closed", |msg| {
-                error!("{msg}: remote_addr={}", self.remote_addr)
-            })
-        })
+        select! {
+            biased;
+            _ = self.cancel.cancelled() => Err(GlobalError::new_sys_error(
+                "tcp sink is closed",
+                |msg| debug!("{msg}: remote_addr={}", self.remote_addr),
+            )),
+            result = self.sender.send(packet) => result.map_err(|_| {
+                GlobalError::new_sys_error("tcp write channel closed", |msg| {
+                    debug!("{msg}: remote_addr={}", self.remote_addr)
+                })
+            }),
+        }
     }
 
     pub fn try_write(&self, data: Bytes) -> GlobalResult<()> {
@@ -390,12 +398,19 @@ where
         let mut stream = self.stream.lock().await;
         if self.cancel.is_cancelled() {
             return Err(GlobalError::new_sys_error("tcp sink is closed", |msg| {
-                error!("{msg}: remote_addr={}", self.remote_addr)
+                debug!("{msg}: remote_addr={}", self.remote_addr)
             }));
         }
-        let result = write_encoded_packet(&mut *stream, packet)
-            .await
-            .hand_log(|msg| error!("{msg}: remote_addr={}", self.remote_addr));
+        let result = select! {
+            biased;
+            _ = self.cancel.cancelled() => Err(GlobalError::new_sys_error(
+                "tcp sink is closed",
+                |msg| debug!("{msg}: remote_addr={}", self.remote_addr),
+            )),
+            result = write_encoded_packet(&mut *stream, packet) => {
+                result.hand_log(|msg| error!("{msg}: remote_addr={}", self.remote_addr))
+            }
+        };
         if result.is_err() {
             self.cancel.cancel();
         }
@@ -476,11 +491,12 @@ pub struct PacketWriter<E = RawPacketEncoder>
 where
     E: PacketEncoder,
 {
-    udp_socket: Option<Arc<UdpSocket>>,
+    udp_socket: Arc<RwLock<Option<Arc<UdpSocket>>>>,
     tcp_writers: Arc<DashMap<SocketAddr, TcpPacketSink<E>>>,
     tcp_writer_addrs_by_ip: Arc<DashMap<IpAddr, SocketAddr>>,
     encoder: Arc<E>,
     tcp_write_mode: TcpWriteMode,
+    closed: CancellationToken,
 }
 
 impl<E> Clone for PacketWriter<E>
@@ -494,6 +510,7 @@ where
             tcp_writer_addrs_by_ip: self.tcp_writer_addrs_by_ip.clone(),
             encoder: self.encoder.clone(),
             tcp_write_mode: self.tcp_write_mode,
+            closed: self.closed.clone(),
         }
     }
 }
@@ -508,11 +525,12 @@ where
         tcp_write_mode: TcpWriteMode,
     ) -> Self {
         Self {
-            udp_socket,
+            udp_socket: Arc::new(RwLock::new(udp_socket)),
             tcp_writers: Arc::new(DashMap::new()),
             tcp_writer_addrs_by_ip: Arc::new(DashMap::new()),
             encoder,
             tcp_write_mode,
+            closed: CancellationToken::new(),
         }
     }
 
@@ -522,16 +540,23 @@ where
         remote_addr: SocketAddr,
         protocol: Protocol,
     ) -> GlobalResult<()> {
+        self.ensure_open()?;
         match protocol {
             Protocol::UDP => {
                 let packet = self.encoder.encode_udp(data)?;
-                let socket = self.udp_socket.as_ref().ok_or_else(|| {
+                let socket = self.udp_socket.read().await;
+                let socket = socket.as_ref().ok_or_else(|| {
                     GlobalError::new_sys_error("udp socket is not available", |msg| error!("{msg}"))
                 })?;
-                socket
-                    .send_to(packet.as_ref(), remote_addr)
-                    .await
-                    .hand_log(|msg| error!("{msg}: remote_addr={remote_addr}"))?;
+                select! {
+                    biased;
+                    _ = self.closed.cancelled() => {
+                        return Err(packet_writer_closed());
+                    }
+                    result = socket.send_to(packet.as_ref(), remote_addr) => {
+                        result.hand_log(|msg| error!("{msg}: remote_addr={remote_addr}"))?;
+                    }
+                }
                 Ok(())
             }
             Protocol::TCP => self.tcp_sink_or_err(remote_addr)?.write(data).await,
@@ -548,15 +573,22 @@ where
         remote_addr: SocketAddr,
         protocol: Protocol,
     ) -> GlobalResult<()> {
+        self.ensure_open()?;
         match protocol {
             Protocol::UDP => {
-                let socket = self.udp_socket.as_ref().ok_or_else(|| {
+                let socket = self.udp_socket.read().await;
+                let socket = socket.as_ref().ok_or_else(|| {
                     GlobalError::new_sys_error("udp socket is not available", |msg| error!("{msg}"))
                 })?;
-                socket
-                    .send_to(data, remote_addr)
-                    .await
-                    .hand_log(|msg| error!("{msg}: remote_addr={remote_addr}"))?;
+                select! {
+                    biased;
+                    _ = self.closed.cancelled() => {
+                        return Err(packet_writer_closed());
+                    }
+                    result = socket.send_to(data, remote_addr) => {
+                        result.hand_log(|msg| error!("{msg}: remote_addr={remote_addr}"))?;
+                    }
+                }
                 Ok(())
             }
             Protocol::TCP => Err(GlobalError::new_sys_error(
@@ -571,6 +603,7 @@ where
     }
 
     pub async fn write_tcp_to_ip(&self, data: Bytes, remote_ip: IpAddr) -> GlobalResult<()> {
+        self.ensure_open()?;
         self.tcp_sink_by_ip(remote_ip)
             .ok_or_else(|| {
                 GlobalError::new_sys_error("tcp writer is not available", |msg| {
@@ -587,10 +620,14 @@ where
         remote_addr: SocketAddr,
         protocol: Protocol,
     ) -> GlobalResult<()> {
+        self.ensure_open()?;
         match protocol {
             Protocol::UDP => {
                 let packet = self.encoder.encode_udp(data)?;
-                let socket = self.udp_socket.as_ref().ok_or_else(|| {
+                let socket = self.udp_socket.try_read().map_err(|_| {
+                    GlobalError::new_sys_error("udp socket is closing", |msg| error!("{msg}"))
+                })?;
+                let socket = socket.as_ref().ok_or_else(|| {
                     GlobalError::new_sys_error("udp socket is not available", |msg| error!("{msg}"))
                 })?;
                 socket
@@ -663,6 +700,10 @@ where
     }
 
     fn insert_tcp_sink(&self, remote_addr: SocketAddr, sink: TcpPacketSink<E>) {
+        if self.closed.is_cancelled() {
+            sink.close();
+            return;
+        }
         self.tcp_writer_addrs_by_ip
             .insert(remote_addr.ip(), remote_addr);
         self.tcp_writers.insert(remote_addr, sink);
@@ -685,6 +726,293 @@ where
     pub fn has_tcp_writer(&self, remote_addr: &SocketAddr) -> bool {
         self.tcp_writers.contains_key(remote_addr)
     }
+
+    fn ensure_open(&self) -> GlobalResult<()> {
+        if self.closed.is_cancelled() {
+            return Err(packet_writer_closed());
+        }
+        Ok(())
+    }
+
+    async fn close(&self) -> GlobalResult<()> {
+        self.closed.cancel();
+
+        let sinks = self
+            .tcp_writers
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect::<Vec<_>>();
+        self.tcp_writers.clear();
+        self.tcp_writer_addrs_by_ip.clear();
+
+        let mut close_error = None;
+        for sink in sinks {
+            sink.close();
+            if let TcpPacketSink::Direct(sink) = sink {
+                if let Err(error) = sink.shutdown().await {
+                    close_error.get_or_insert(error);
+                }
+            }
+        }
+        self.udp_socket.write().await.take();
+
+        match close_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
+fn packet_writer_closed() -> GlobalError {
+    GlobalError::new_sys_error("packet writer is closed", |_| {})
+}
+
+/// Aggregated result of stopping all tasks owned by a managed network endpoint.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct NetworkCloseReport {
+    pub completed: usize,
+    pub cancelled: usize,
+    pub failed: usize,
+    pub panicked: usize,
+    pub remaining: usize,
+}
+
+impl NetworkCloseReport {
+    /// Returns `true` when every owned task reached a terminal state without failure.
+    pub fn is_complete(&self) -> bool {
+        self.failed == 0 && self.panicked == 0 && self.remaining == 0
+    }
+
+    fn merge(&mut self, other: ManagedTaskReport) {
+        self.completed += other.completed;
+        self.cancelled += other.cancelled;
+        self.failed += other.failed;
+        self.panicked += other.panicked;
+        self.remaining += other.remaining;
+    }
+}
+
+#[derive(Default)]
+struct ManagedTaskReport {
+    completed: usize,
+    cancelled: usize,
+    failed: usize,
+    panicked: usize,
+    remaining: usize,
+}
+
+impl ManagedTaskReport {
+    fn merge(&mut self, other: Self) {
+        self.completed += other.completed;
+        self.cancelled += other.cancelled;
+        self.failed += other.failed;
+        self.panicked += other.panicked;
+        self.remaining += other.remaining;
+    }
+}
+
+struct ManagedCloseState {
+    root_task: Option<JoinHandle<ManagedTaskReport>>,
+    report: NetworkCloseReport,
+    writer_closed: bool,
+    completed: bool,
+    failure_logged: bool,
+}
+
+/// Owns a packet writer and the lifecycle of its TCP/UDP receive tasks.
+///
+/// Dropping this value requests cancellation but does not wait for resource release. Owners that
+/// require deterministic listener release must call [`ManagedPacketIo::close_and_wait`].
+#[must_use = "managed packet I/O must be retained and closed explicitly"]
+pub struct ManagedPacketIo<E = RawPacketEncoder>
+where
+    E: PacketEncoder,
+{
+    writer: PacketWriter<E>,
+    cancel: CancellationToken,
+    close_state: Mutex<ManagedCloseState>,
+}
+
+impl<E> ManagedPacketIo<E>
+where
+    E: PacketEncoder,
+{
+    /// Returns a clone of the writer bound to this managed endpoint.
+    pub fn writer(&self) -> PacketWriter<E> {
+        self.writer.clone()
+    }
+
+    /// Cancels all owned work and waits until the writer and protocol tasks are closed.
+    ///
+    /// The operation is idempotent and cancellation-safe: if the waiting future is dropped, a
+    /// later call resumes cleanup without losing the root task handle.
+    pub async fn close_and_wait(&self) -> GlobalResult<NetworkCloseReport> {
+        let mut state = self.close_state.lock().await;
+        if state.completed {
+            return close_report_result(state.report.clone(), false);
+        }
+
+        self.cancel.cancel();
+        if !state.writer_closed {
+            let close_result = self.writer.close().await;
+            state.writer_closed = true;
+            if let Err(close_error) = close_result {
+                debug!("managed packet writer close failed: {close_error}");
+                state.report.failed += 1;
+            }
+        }
+
+        let root_result = match state.root_task.as_mut() {
+            Some(root_task) => Some(root_task.await),
+            None => None,
+        };
+        if let Some(root_result) = root_result {
+            state.root_task.take();
+            match root_result {
+                Ok(task_report) => state.report.merge(task_report),
+                Err(join_error) => record_join_error(&mut state.report, join_error),
+            }
+        }
+
+        state.completed = true;
+        let log_failure = !state.failure_logged;
+        if !state.report.is_complete() {
+            state.failure_logged = true;
+        }
+        close_report_result(state.report.clone(), log_failure)
+    }
+}
+
+impl<E> Drop for ManagedPacketIo<E>
+where
+    E: PacketEncoder,
+{
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+fn close_report_result(
+    report: NetworkCloseReport,
+    log_failure: bool,
+) -> GlobalResult<NetworkCloseReport> {
+    if report.is_complete() {
+        return Ok(report);
+    }
+    let message = format!(
+        "managed network close incomplete: completed={}, cancelled={}, failed={}, panicked={}, remaining={}",
+        report.completed, report.cancelled, report.failed, report.panicked, report.remaining
+    );
+    Err(GlobalError::new_sys_error(&message, |msg| {
+        if log_failure {
+            error!("{msg}");
+        }
+    }))
+}
+
+fn record_join_error(report: &mut NetworkCloseReport, join_error: JoinError) {
+    if join_error.is_panic() {
+        report.panicked += 1;
+    } else if join_error.is_cancelled() {
+        report.cancelled += 1;
+        report.remaining += 1;
+    } else {
+        report.failed += 1;
+    }
+}
+
+/// Starts managed packet I/O with the default queued TCP writer.
+pub fn managed_rw<D, S, E>(
+    runtime: &GlobalRuntime,
+    task_name: impl Into<String>,
+    tu: (Option<std::net::TcpListener>, Option<std::net::UdpSocket>),
+    cancel: CancellationToken,
+    dispatcher: Arc<D>,
+    encoder: Arc<E>,
+) -> GlobalResult<ManagedPacketIo<E>>
+where
+    D: PacketDispatcher,
+    S: PacketSplitter + Default,
+    E: PacketEncoder,
+{
+    managed_rw_with_tcp_write_mode::<D, S, E>(
+        runtime,
+        task_name,
+        tu,
+        cancel,
+        dispatcher,
+        encoder,
+        TcpWriteMode::default(),
+    )
+}
+
+/// Starts managed packet I/O with direct TCP writes.
+pub fn managed_direct_rw<D, S, E>(
+    runtime: &GlobalRuntime,
+    task_name: impl Into<String>,
+    tu: (Option<std::net::TcpListener>, Option<std::net::UdpSocket>),
+    cancel: CancellationToken,
+    dispatcher: Arc<D>,
+    encoder: Arc<E>,
+) -> GlobalResult<ManagedPacketIo<E>>
+where
+    D: PacketDispatcher,
+    S: PacketSplitter + Default,
+    E: PacketEncoder,
+{
+    managed_rw_with_tcp_write_mode::<D, S, E>(
+        runtime,
+        task_name,
+        tu,
+        cancel,
+        dispatcher,
+        encoder,
+        TcpWriteMode::Direct,
+    )
+}
+
+/// Starts managed packet I/O with an explicit TCP write mode.
+///
+/// TCP accept/read work and UDP receive work run in independent protocol tasks. A single runtime
+/// supervisor owns those tasks and provides deterministic shutdown through [`ManagedPacketIo`].
+pub fn managed_rw_with_tcp_write_mode<D, S, E>(
+    runtime: &GlobalRuntime,
+    task_name: impl Into<String>,
+    tu: (Option<std::net::TcpListener>, Option<std::net::UdpSocket>),
+    external_cancel: CancellationToken,
+    dispatcher: Arc<D>,
+    encoder: Arc<E>,
+    tcp_write_mode: TcpWriteMode,
+) -> GlobalResult<ManagedPacketIo<E>>
+where
+    D: PacketDispatcher,
+    S: PacketSplitter + Default,
+    E: PacketEncoder,
+{
+    let (tcp_listener, udp_socket, writer) = prepare_packet_io(tu, encoder, tcp_write_mode)?;
+    let cancel = runtime.cancel.child_token();
+    let root_task = runtime.spawn(
+        task_name,
+        run_managed_packet_io::<D, S, E>(
+            tcp_listener,
+            udp_socket,
+            cancel.clone(),
+            external_cancel,
+            dispatcher,
+            writer.clone(),
+        ),
+    )?;
+    Ok(ManagedPacketIo {
+        writer,
+        cancel,
+        close_state: Mutex::new(ManagedCloseState {
+            root_task: Some(root_task),
+            report: NetworkCloseReport::default(),
+            writer_closed: false,
+            completed: false,
+            failure_logged: false,
+        }),
+    })
 }
 
 pub fn reader<D, S>(
@@ -767,17 +1095,19 @@ where
     S: PacketSplitter + Default,
     E: PacketEncoder,
 {
-    let (tcp, udp) = tu;
-    let udp_socket = match udp {
-        Some(udp) => Some(into_tokio_udp_socket(udp)?),
-        None => None,
-    };
-    let writer = PacketWriter::new(udp_socket.clone(), encoder, tcp_write_mode);
-    if let Some(tcp) = tcp {
-        spawn_tcp_rw::<D, S, E>(tcp, cancel.clone(), dispatcher.clone(), writer.clone())?;
+    let (tcp_listener, udp_socket, writer) = prepare_packet_io(tu, encoder, tcp_write_mode)?;
+    if let Some(tcp_listener) = tcp_listener {
+        drop(tokio::spawn(run_tcp_listener::<D, S, E>(
+            tcp_listener,
+            cancel.clone(),
+            dispatcher.clone(),
+            writer.clone(),
+        )));
     }
     if let Some(udp_socket) = udp_socket {
-        spawn_udp_rw(udp_socket, cancel, dispatcher)?;
+        drop(tokio::spawn(run_udp_receiver(
+            udp_socket, cancel, dispatcher,
+        )));
     }
     Ok(writer)
 }
@@ -792,6 +1122,32 @@ where
     S: PacketSplitter + Default,
 {
     rw::<D, S, RawPacketEncoder>(tu, cancel, dispatcher, Arc::new(RawPacketEncoder))
+}
+
+type PreparedPacketIo<E> = (
+    Option<tokio::net::TcpListener>,
+    Option<Arc<UdpSocket>>,
+    PacketWriter<E>,
+);
+
+fn prepare_packet_io<E>(
+    tu: (Option<std::net::TcpListener>, Option<std::net::UdpSocket>),
+    encoder: Arc<E>,
+    tcp_write_mode: TcpWriteMode,
+) -> GlobalResult<PreparedPacketIo<E>>
+where
+    E: PacketEncoder,
+{
+    let (tcp, udp) = tu;
+    let tcp_listener = tcp.map(into_tokio_tcp_listener).transpose()?;
+    let udp_socket = udp.map(into_tokio_udp_socket).transpose()?;
+    let writer = PacketWriter::new(udp_socket.clone(), encoder, tcp_write_mode);
+    Ok((tcp_listener, udp_socket, writer))
+}
+
+fn into_tokio_tcp_listener(tcp: std::net::TcpListener) -> GlobalResult<tokio::net::TcpListener> {
+    tcp.set_nonblocking(true).hand_log(|msg| error!("{msg}"))?;
+    tokio::net::TcpListener::from_std(tcp).hand_log(|msg| error!("{msg}"))
 }
 
 fn spawn_tcp<D, S>(
@@ -882,8 +1238,178 @@ where
     Ok(())
 }
 
-fn spawn_tcp_rw<D, S, E>(
-    tcp: std::net::TcpListener,
+async fn run_managed_packet_io<D, S, E>(
+    tcp_listener: Option<tokio::net::TcpListener>,
+    udp_socket: Option<Arc<UdpSocket>>,
+    cancel: CancellationToken,
+    external_cancel: CancellationToken,
+    dispatcher: Arc<D>,
+    writer: PacketWriter<E>,
+) -> ManagedTaskReport
+where
+    D: PacketDispatcher,
+    S: PacketSplitter + Default,
+    E: PacketEncoder,
+{
+    let mut report = ManagedTaskReport::default();
+    let mut protocol_tasks = JoinSet::new();
+
+    if let Some(tcp_listener) = tcp_listener {
+        protocol_tasks.spawn(run_tcp_listener::<D, S, E>(
+            tcp_listener,
+            cancel.clone(),
+            dispatcher.clone(),
+            writer,
+        ));
+    }
+    if let Some(udp_socket) = udp_socket {
+        protocol_tasks.spawn(run_udp_receiver(udp_socket, cancel.clone(), dispatcher));
+    }
+
+    if protocol_tasks.is_empty() {
+        report.completed += 1;
+        return report;
+    }
+
+    let mut watch_external_cancel = true;
+    while !protocol_tasks.is_empty() {
+        select! {
+            biased;
+
+            _ = external_cancel.cancelled(), if watch_external_cancel => {
+                watch_external_cancel = false;
+                cancel.cancel();
+            }
+
+            joined = protocol_tasks.join_next() => {
+                if let Some(joined) = joined {
+                    record_protocol_join(&mut report, joined);
+                }
+            }
+        }
+    }
+    report
+}
+
+async fn run_tcp_listener<D, S, E>(
+    tcp_listener: tokio::net::TcpListener,
+    cancel: CancellationToken,
+    dispatcher: Arc<D>,
+    writer: PacketWriter<E>,
+) -> ManagedTaskReport
+where
+    D: PacketDispatcher,
+    S: PacketSplitter + Default,
+    E: PacketEncoder,
+{
+    let mut report = ManagedTaskReport::default();
+    let mut connections = JoinSet::new();
+
+    loop {
+        select! {
+            biased;
+
+            _ = cancel.cancelled() => {
+                report.cancelled += 1;
+                break;
+            }
+
+            joined = connections.join_next(), if !connections.is_empty() => {
+                if let Some(joined) = joined {
+                    record_connection_join(&mut report, joined);
+                }
+            }
+
+            accepted = tcp_listener.accept() => {
+                match accepted {
+                    Ok((stream, remote_addr)) if !cancel.is_cancelled() => {
+                        connections.spawn(run_managed_tcp_connection::<D, S, E>(
+                            stream,
+                            remote_addr,
+                            cancel.child_token(),
+                            dispatcher.clone(),
+                            writer.clone(),
+                        ));
+                    }
+                    Ok(_) => break,
+                    Err(error) => {
+                        report.failed += 1;
+                        debug!("tcp accept failed: {error}");
+                    }
+                }
+            }
+        }
+    }
+
+    cancel.cancel();
+    while let Some(joined) = connections.join_next().await {
+        record_connection_join(&mut report, joined);
+    }
+    report
+}
+
+async fn run_udp_receiver<D>(
+    udp_socket: Arc<UdpSocket>,
+    cancel: CancellationToken,
+    dispatcher: Arc<D>,
+) -> ManagedTaskReport
+where
+    D: PacketDispatcher,
+{
+    let mut report = ManagedTaskReport::default();
+    loop {
+        let mut buf = BytesMut::with_capacity(UDP_RECV_BUF_SIZE);
+        select! {
+            biased;
+
+            _ = cancel.cancelled() => {
+                report.cancelled += 1;
+                break;
+            }
+
+            received = udp_socket_read_owned_buf(&mut buf, udp_socket.as_ref()) => {
+                match received {
+                    Ok((size, remote_addr)) if size != 0 => {
+                        let packet = buf.split_to(size).freeze();
+                        if let Err(error) = dispatcher.dispatch_owned(
+                            packet,
+                            remote_addr,
+                            Protocol::UDP,
+                        ) {
+                            debug!("udp dispatch {remote_addr} failed: {error}");
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        report.failed += 1;
+                        debug!("udp read failed: {error}");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    report
+}
+
+fn record_protocol_join(
+    report: &mut ManagedTaskReport,
+    joined: Result<ManagedTaskReport, JoinError>,
+) {
+    match joined {
+        Ok(task_report) => report.merge(task_report),
+        Err(join_error) if join_error.is_panic() => report.panicked += 1,
+        Err(join_error) if join_error.is_cancelled() => {
+            report.cancelled += 1;
+            report.remaining += 1;
+        }
+        Err(_) => report.failed += 1,
+    }
+}
+
+async fn run_managed_tcp_connection<D, S, E>(
+    stream: TcpStream,
+    remote_addr: SocketAddr,
     cancel: CancellationToken,
     dispatcher: Arc<D>,
     writer: PacketWriter<E>,
@@ -893,71 +1419,63 @@ where
     S: PacketSplitter + Default,
     E: PacketEncoder,
 {
-    tcp.set_nonblocking(true).hand_log(|msg| error!("{msg}"))?;
-    let listener = tokio::net::TcpListener::from_std(tcp).hand_log(|msg| error!("{msg}"))?;
-
-    tokio::spawn(async move {
-        loop {
-            select! {
-                biased;
-
-                res = listener.accept() => {
-                    match res {
-                        Ok((stream, remote_addr)) => {
-                            let dispatcher = dispatcher.clone();
-                            let cancel = cancel.clone();
-                            let conn_cancel = cancel.child_token();
-                            let writer = writer.clone();
-                            let (read_half, write_half) = stream.into_split();
-                            match writer.tcp_write_mode().queue_size() {
-                                Some(queue_size) => {
-                                    let (tx, rx) = mpsc::channel(queue_size);
-                                    writer.insert_tcp_writer(remote_addr, tx, conn_cancel.clone());
-                                    tokio::spawn(handle_tcp_read_owned_half::<D, S, E>(
-                                        read_half,
-                                        remote_addr,
-                                        conn_cancel.clone(),
-                                        dispatcher,
-                                        S::default(),
-                                        writer.clone(),
-                                    ));
-                                    tokio::spawn(handle_tcp_write::<E>(
-                                        write_half,
-                                        remote_addr,
-                                        conn_cancel,
-                                        rx,
-                                        writer,
-                                    ));
-                                }
-                                None => {
-                                    writer.insert_direct_tcp_writer(
-                                        remote_addr,
-                                        write_half,
-                                        conn_cancel.clone(),
-                                    );
-                                    tokio::spawn(handle_tcp_read_owned_half::<D, S, E>(
-                                        read_half,
-                                        remote_addr,
-                                        conn_cancel,
-                                        dispatcher,
-                                        S::default(),
-                                        writer,
-                                    ));
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            error!("accept failed: {e}");
-                        }
-                    }
-                }
-
-                _ = cancel.cancelled() => break,
-            }
+    let (read_half, write_half) = stream.into_split();
+    match writer.tcp_write_mode().queue_size() {
+        Some(queue_size) => {
+            let (tx, rx) = mpsc::channel(queue_size);
+            writer.insert_tcp_writer(remote_addr, tx, cancel.clone());
+            let (read_result, write_result) = tokio::join!(
+                handle_tcp_read_owned_half::<D, S, E>(
+                    read_half,
+                    remote_addr,
+                    cancel.clone(),
+                    dispatcher,
+                    S::default(),
+                    writer.clone(),
+                ),
+                handle_tcp_write::<E>(write_half, remote_addr, cancel, rx, writer),
+            );
+            read_result?;
+            write_result
         }
-    });
+        None => {
+            writer.insert_direct_tcp_writer(remote_addr, write_half, cancel.clone());
+            handle_tcp_read_owned_half::<D, S, E>(
+                read_half,
+                remote_addr,
+                cancel,
+                dispatcher,
+                S::default(),
+                writer,
+            )
+            .await
+        }
+    }
+}
 
-    Ok(())
+fn record_connection_join(
+    report: &mut ManagedTaskReport,
+    joined: Result<GlobalResult<()>, JoinError>,
+) {
+    match joined {
+        Ok(Ok(())) => report.completed += 1,
+        Ok(Err(error)) => {
+            report.failed += 1;
+            debug!("managed tcp connection failed: {error}");
+        }
+        Err(join_error) if join_error.is_panic() => {
+            report.panicked += 1;
+            error!("managed tcp connection panicked: {join_error}");
+        }
+        Err(join_error) if join_error.is_cancelled() => {
+            report.cancelled += 1;
+            report.remaining += 1;
+        }
+        Err(join_error) => {
+            report.failed += 1;
+            error!("managed tcp connection join failed: {join_error}");
+        }
+    }
 }
 
 async fn handle_tcp<D, S>(
@@ -1086,7 +1604,8 @@ async fn handle_tcp_write<E>(
     cancel: CancellationToken,
     mut rx: mpsc::Receiver<EncodedPacket>,
     writer: PacketWriter<E>,
-) where
+) -> GlobalResult<()>
+where
     E: PacketEncoder,
 {
     loop {
@@ -1105,7 +1624,10 @@ async fn handle_tcp_write<E>(
     }
     cancel.cancel();
     writer.remove_tcp_writer(&remote_addr);
-    let _ = stream.shutdown().await;
+    stream
+        .shutdown()
+        .await
+        .hand_log(|msg| debug!("{msg}: remote_addr={remote_addr}"))
 }
 
 async fn write_encoded_packet<W>(stream: &mut W, packet: EncodedPacket) -> io::Result<()>
@@ -1225,42 +1747,6 @@ where
     Ok(())
 }
 
-fn spawn_udp_rw<D>(
-    socket: Arc<UdpSocket>,
-    cancel: CancellationToken,
-    dispatcher: Arc<D>,
-) -> GlobalResult<()>
-where
-    D: PacketDispatcher,
-{
-    tokio::spawn(async move {
-        loop {
-            let mut buf = BytesMut::with_capacity(UDP_RECV_BUF_SIZE);
-            select! {
-                res = udp_socket_read_owned_buf(&mut buf, socket.as_ref()) => {
-                    match res {
-                        Ok((n,addr)) if n != 0 => {
-                            let pkt = buf.split_to(n).freeze();
-                            if let Err(err) = dispatcher.dispatch_owned(pkt, addr, Protocol::UDP) {
-                                debug!("udp dispatch {addr} failed: {err}");
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(err) => {
-                            debug!("udp read failed: {err}");
-                            break;
-                        }
-                    }
-                }
-
-                _ = cancel.cancelled() => break,
-            }
-        }
-    });
-
-    Ok(())
-}
-
 async fn udp_socket_read_owned_buf(
     buf: &mut BytesMut,
     socket: &UdpSocket,
@@ -1273,12 +1759,66 @@ async fn udp_socket_read_owned_buf(
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_tcp_write, PacketWriter, RawPacketEncoder, TcpWriteMode};
+    use super::{
+        handle_tcp_write, into_tokio_udp_socket, managed_rw_with_tcp_write_mode, ManagedCloseState,
+        ManagedPacketIo, ManagedTaskReport, NetworkCloseReport, PacketDispatcher, PacketSplitter,
+        PacketWriter, RawPacketEncoder, TcpWriteMode,
+    };
+    use crate::net::state::Protocol;
     use crate::tokio;
     use crate::tokio::net::{TcpListener, TcpStream};
-    use crate::tokio::sync::mpsc;
+    use crate::tokio::sync::{mpsc, Mutex, Notify};
     use crate::tokio_util::sync::CancellationToken;
+    use crate::utils::rt::GlobalRuntime;
+    use bytes::{Bytes, BytesMut};
+    use exception::GlobalResult;
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[derive(Default)]
+    struct DrainSplitter;
+
+    impl PacketSplitter for DrainSplitter {
+        fn feed_owned<F>(&mut self, chunk: &mut BytesMut, mut dispatch: F) -> GlobalResult<()>
+        where
+            F: FnMut(Bytes) -> GlobalResult<()>,
+        {
+            if !chunk.is_empty() {
+                dispatch(chunk.split().freeze())?;
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct TestDispatcher {
+        udp_packets: AtomicUsize,
+        tcp_closes: AtomicUsize,
+    }
+
+    impl PacketDispatcher for TestDispatcher {
+        fn dispatch_owned(
+            &self,
+            _data: Bytes,
+            _remote_addr: SocketAddr,
+            protocol: Protocol,
+        ) -> GlobalResult<()> {
+            if protocol == Protocol::UDP {
+                self.udp_packets.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(())
+        }
+
+        fn close(&self, _remote_addr: SocketAddr, protocol: Protocol) -> GlobalResult<()> {
+            if protocol == Protocol::TCP {
+                self.tcp_closes.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(())
+        }
+    }
 
     #[test]
     fn inline_prefix_macro_uses_numeric_width_and_endian() {
@@ -1315,9 +1855,191 @@ mod tests {
         let (tx, rx) = mpsc::channel(1);
         drop(tx);
 
-        handle_tcp_write(write_half, remote_addr, cancel.clone(), rx, writer).await;
+        handle_tcp_write(write_half, remote_addr, cancel.clone(), rx, writer)
+            .await
+            .unwrap();
 
         assert!(cancel.is_cancelled());
         drop(client);
+    }
+
+    #[tokio::test]
+    async fn packet_writer_close_finishes_cleanup_after_prior_cancellation() {
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let local_addr = udp.local_addr().unwrap();
+        let writer = PacketWriter::new(
+            Some(into_tokio_udp_socket(udp).unwrap()),
+            Arc::new(RawPacketEncoder),
+            TcpWriteMode::Direct,
+        );
+
+        writer.closed.cancel();
+        writer.close().await.unwrap();
+
+        let rebound = std::net::UdpSocket::bind(local_addr).unwrap();
+        drop(rebound);
+    }
+
+    #[tokio::test]
+    async fn managed_close_resumes_after_waiter_timeout() {
+        let release = Arc::new(Notify::new());
+        let task_release = release.clone();
+        let root_task = tokio::spawn(async move {
+            task_release.notified().await;
+            ManagedTaskReport {
+                completed: 1,
+                ..ManagedTaskReport::default()
+            }
+        });
+        let managed = ManagedPacketIo {
+            writer: PacketWriter::new(None, Arc::new(RawPacketEncoder), TcpWriteMode::Direct),
+            cancel: CancellationToken::new(),
+            close_state: Mutex::new(ManagedCloseState {
+                root_task: Some(root_task),
+                report: NetworkCloseReport::default(),
+                writer_closed: false,
+                completed: false,
+                failure_logged: false,
+            }),
+        };
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), managed.close_and_wait())
+                .await
+                .is_err()
+        );
+        {
+            let state = managed.close_state.lock().await;
+            assert!(state.root_task.is_some());
+            assert!(state.writer_closed);
+            assert!(!state.completed);
+        }
+
+        release.notify_one();
+        let report = tokio::time::timeout(Duration::from_secs(1), managed.close_and_wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.completed, 1);
+        assert!(report.is_complete());
+    }
+
+    #[tokio::test]
+    async fn managed_close_is_idempotent_and_releases_tcp_udp_listeners() {
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let local_addr = tcp.local_addr().unwrap();
+        let udp = std::net::UdpSocket::bind(local_addr).unwrap();
+        let dispatcher = Arc::new(TestDispatcher::default());
+        let managed =
+            managed_rw_with_tcp_write_mode::<TestDispatcher, DrainSplitter, RawPacketEncoder>(
+                &GlobalRuntime::get_main_runtime(),
+                format!("managed-listener-release-{local_addr}"),
+                (Some(tcp), Some(udp)),
+                CancellationToken::new(),
+                dispatcher.clone(),
+                Arc::new(RawPacketEncoder),
+                TcpWriteMode::Direct,
+            )
+            .unwrap();
+        let writer = managed.writer();
+        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender.send_to(b"packet", local_addr).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while dispatcher.udp_packets.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let first = managed.close_and_wait().await.unwrap();
+        let second = managed.close_and_wait().await.unwrap();
+
+        assert_eq!(first, second);
+        assert!(first.is_complete());
+        assert_eq!(first.cancelled, 2);
+        assert!(writer
+            .write_slice_to(b"closed", sender.local_addr().unwrap(), Protocol::UDP)
+            .await
+            .is_err());
+        let rebound_tcp = std::net::TcpListener::bind(local_addr).unwrap();
+        let rebound_udp = std::net::UdpSocket::bind(local_addr).unwrap();
+        drop((rebound_tcp, rebound_udp));
+    }
+
+    #[tokio::test]
+    async fn managed_close_waits_for_active_tcp_read_and_writer_tasks() {
+        for (name, write_mode) in [
+            ("queued", TcpWriteMode::Queued { queue_size: 4 }),
+            ("direct", TcpWriteMode::Direct),
+        ] {
+            let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let local_addr = tcp.local_addr().unwrap();
+            let dispatcher = Arc::new(TestDispatcher::default());
+            let managed =
+                managed_rw_with_tcp_write_mode::<TestDispatcher, DrainSplitter, RawPacketEncoder>(
+                    &GlobalRuntime::get_main_runtime(),
+                    format!("managed-active-{name}-{local_addr}"),
+                    (Some(tcp), None),
+                    CancellationToken::new(),
+                    dispatcher.clone(),
+                    Arc::new(RawPacketEncoder),
+                    write_mode,
+                )
+                .unwrap();
+            let writer = managed.writer();
+            let mut client = TcpStream::connect(local_addr).await.unwrap();
+            let remote_addr = client.local_addr().unwrap();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !writer.has_tcp_writer(&remote_addr) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            client.write_all(b"packet").await.unwrap();
+
+            let report = managed.close_and_wait().await.unwrap();
+
+            assert!(report.is_complete(), "write_mode={name}: {report:?}");
+            assert_eq!(report.cancelled, 1, "write_mode={name}");
+            assert!(report.completed >= 1, "write_mode={name}: {report:?}");
+            assert!(!writer.has_tcp_writer(&remote_addr));
+            assert_eq!(dispatcher.tcp_closes.load(Ordering::Relaxed), 1);
+            let mut byte = [0u8; 1];
+            let read = tokio::time::timeout(Duration::from_secs(1), client.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(read, 0, "write_mode={name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_close_rejects_an_aborted_root_task() {
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let local_addr = udp.local_addr().unwrap();
+        let managed =
+            managed_rw_with_tcp_write_mode::<TestDispatcher, DrainSplitter, RawPacketEncoder>(
+                &GlobalRuntime::get_main_runtime(),
+                format!("managed-aborted-root-{local_addr}"),
+                (None, Some(udp)),
+                CancellationToken::new(),
+                Arc::new(TestDispatcher::default()),
+                Arc::new(RawPacketEncoder),
+                TcpWriteMode::Direct,
+            )
+            .unwrap();
+        {
+            let state = managed.close_state.lock().await;
+            state.root_task.as_ref().unwrap().abort();
+        }
+
+        assert!(managed.close_and_wait().await.is_err());
+        let state = managed.close_state.lock().await;
+        let report = &state.report;
+        assert_eq!(report.cancelled, 1);
+        assert_eq!(report.remaining, 1);
+        assert!(!report.is_complete());
     }
 }
