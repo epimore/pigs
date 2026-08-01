@@ -4,9 +4,11 @@ use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use exception::{GlobalError, GlobalResult, GlobalResultExt};
 use log::{debug, error, warn};
+use std::collections::{HashMap, HashSet};
 use std::io::{self, IoSlice};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock, Weak};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
@@ -38,7 +40,9 @@ pub trait PacketSplitter: Send + 'static {
 const MAX_BUF_SIZE: usize = 2 * 1024 * 1024;
 const TCP_READ_BUF_SIZE: usize = 64 * 1024;
 const TCP_MIN_READ_SPARE: usize = 4 * 1024;
-const UDP_RECV_BUF_SIZE: usize = 2 * 1024;
+const UDP_MAX_DATAGRAM_SIZE: usize = u16::MAX as usize;
+const TCP_ACCEPT_ERROR_BACKOFF_MIN: std::time::Duration = std::time::Duration::from_millis(10);
+const TCP_ACCEPT_ERROR_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(1);
 
 const TCP_WRITE_QUEUE_SIZE: usize = 1024;
 pub const INLINE_PREFIX_CAPACITY: usize = 16;
@@ -487,13 +491,29 @@ where
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TcpWriterRegistration {
+    remote_addr: SocketAddr,
+    writer_id: u64,
+}
+
+struct RegisteredTcpSink<E>
+where
+    E: PacketEncoder,
+{
+    registration: TcpWriterRegistration,
+    sink: TcpPacketSink<E>,
+}
+
 pub struct PacketWriter<E = RawPacketEncoder>
 where
     E: PacketEncoder,
 {
     udp_socket: Arc<RwLock<Option<Arc<UdpSocket>>>>,
-    tcp_writers: Arc<DashMap<SocketAddr, TcpPacketSink<E>>>,
-    tcp_writer_addrs_by_ip: Arc<DashMap<IpAddr, SocketAddr>>,
+    tcp_writers: Arc<DashMap<SocketAddr, RegisteredTcpSink<E>>>,
+    tcp_writer_addrs_by_ip: Arc<DashMap<IpAddr, Vec<TcpWriterRegistration>>>,
+    tcp_writer_registry_lock: Arc<StdRwLock<()>>,
+    next_tcp_writer_id: Arc<AtomicU64>,
     tcp_writer_ready: Arc<Notify>,
     encoder: Arc<E>,
     tcp_write_mode: TcpWriteMode,
@@ -509,6 +529,8 @@ where
             udp_socket: self.udp_socket.clone(),
             tcp_writers: self.tcp_writers.clone(),
             tcp_writer_addrs_by_ip: self.tcp_writer_addrs_by_ip.clone(),
+            tcp_writer_registry_lock: self.tcp_writer_registry_lock.clone(),
+            next_tcp_writer_id: self.next_tcp_writer_id.clone(),
             tcp_writer_ready: self.tcp_writer_ready.clone(),
             encoder: self.encoder.clone(),
             tcp_write_mode: self.tcp_write_mode,
@@ -530,6 +552,8 @@ where
             udp_socket: Arc::new(RwLock::new(udp_socket)),
             tcp_writers: Arc::new(DashMap::new()),
             tcp_writer_addrs_by_ip: Arc::new(DashMap::new()),
+            tcp_writer_registry_lock: Arc::new(StdRwLock::new(())),
+            next_tcp_writer_id: Arc::new(AtomicU64::new(1)),
             tcp_writer_ready: Arc::new(Notify::new()),
             encoder,
             tcp_write_mode,
@@ -653,15 +677,18 @@ where
     pub fn tcp_sink(&self, remote_addr: &SocketAddr) -> Option<TcpPacketSink<E>> {
         self.tcp_writers
             .get(remote_addr)
-            .map(|item| item.value().clone())
+            .map(|item| item.value().sink.clone())
     }
 
     pub fn tcp_sink_by_ip(&self, remote_ip: IpAddr) -> Option<TcpPacketSink<E>> {
-        let remote_addr = self
-            .tcp_writer_addrs_by_ip
-            .get(&remote_ip)
-            .map(|item| *item.value())?;
-        self.tcp_sink(&remote_addr)
+        let _registry_guard = read_unpoisoned(&self.tcp_writer_registry_lock);
+        let registrations = self.tcp_writer_addrs_by_ip.get(&remote_ip)?;
+        registrations.iter().rev().find_map(|registration| {
+            self.tcp_writers
+                .get(&registration.remote_addr)
+                .filter(|registered| registered.registration == *registration)
+                .map(|registered| registered.sink.clone())
+        })
     }
 
     /// Waits until the exact TCP peer writer is registered or the deadline/endpoint closes.
@@ -715,13 +742,22 @@ where
         sender: mpsc::Sender<EncodedPacket>,
         cancel: CancellationToken,
     ) {
+        self.insert_registered_tcp_writer(remote_addr, sender, cancel);
+    }
+
+    fn insert_registered_tcp_writer(
+        &self,
+        remote_addr: SocketAddr,
+        sender: mpsc::Sender<EncodedPacket>,
+        cancel: CancellationToken,
+    ) -> Option<TcpWriterRegistration> {
         let sink = TcpPacketSink::Queued(QueuedTcpSink::new(
             remote_addr,
             sender,
             self.encoder.clone(),
             cancel,
         ));
-        self.insert_tcp_sink(remote_addr, sink);
+        self.insert_tcp_sink(remote_addr, sink)
     }
 
     pub fn insert_direct_tcp_writer(
@@ -730,38 +766,102 @@ where
         stream: OwnedWriteHalf,
         cancel: CancellationToken,
     ) {
+        self.insert_registered_direct_tcp_writer(remote_addr, stream, cancel);
+    }
+
+    fn insert_registered_direct_tcp_writer(
+        &self,
+        remote_addr: SocketAddr,
+        stream: OwnedWriteHalf,
+        cancel: CancellationToken,
+    ) -> Option<TcpWriterRegistration> {
         let sink = TcpPacketSink::Direct(DirectTcpSink::new(
             remote_addr,
             stream,
             self.encoder.clone(),
             cancel,
         ));
-        self.insert_tcp_sink(remote_addr, sink);
+        self.insert_tcp_sink(remote_addr, sink)
     }
 
-    fn insert_tcp_sink(&self, remote_addr: SocketAddr, sink: TcpPacketSink<E>) {
+    fn insert_tcp_sink(
+        &self,
+        remote_addr: SocketAddr,
+        sink: TcpPacketSink<E>,
+    ) -> Option<TcpWriterRegistration> {
         if self.closed.is_cancelled() {
             sink.close();
-            return;
+            return None;
         }
-        self.tcp_writer_addrs_by_ip
-            .insert(remote_addr.ip(), remote_addr);
-        self.tcp_writers.insert(remote_addr, sink);
+        let writer_id = self.next_tcp_writer_id.fetch_add(1, Ordering::Relaxed);
+        let registration = TcpWriterRegistration {
+            remote_addr,
+            writer_id,
+        };
+        let previous = {
+            let _registry_guard = write_unpoisoned(&self.tcp_writer_registry_lock);
+            if self.closed.is_cancelled() {
+                sink.close();
+                return None;
+            }
+            let previous = self
+                .tcp_writers
+                .insert(remote_addr, RegisteredTcpSink { registration, sink });
+            let mut registrations = self
+                .tcp_writer_addrs_by_ip
+                .entry(remote_addr.ip())
+                .or_default();
+            registrations.retain(|item| item.remote_addr != remote_addr);
+            registrations.push(registration);
+            previous
+        };
+        if let Some(previous) = previous {
+            previous.sink.close();
+        }
         self.tcp_writer_ready.notify_waiters();
+        Some(registration)
     }
 
     pub fn remove_tcp_writer(&self, remote_addr: &SocketAddr) {
-        if let Some((_, handle)) = self.tcp_writers.remove(remote_addr) {
-            let remote_ip = remote_addr.ip();
-            if self
-                .tcp_writer_addrs_by_ip
-                .get(&remote_ip)
-                .is_some_and(|item| *item.value() == *remote_addr)
-            {
-                self.tcp_writer_addrs_by_ip.remove(&remote_ip);
-            }
-            handle.close();
+        if let Some(sink) = self.remove_tcp_writer_inner(remote_addr, None) {
+            sink.close();
         }
+    }
+
+    fn remove_registered_tcp_writer(&self, registration: TcpWriterRegistration) {
+        if let Some(sink) =
+            self.remove_tcp_writer_inner(&registration.remote_addr, Some(registration.writer_id))
+        {
+            sink.close();
+        }
+    }
+
+    fn remove_tcp_writer_inner(
+        &self,
+        remote_addr: &SocketAddr,
+        expected_writer_id: Option<u64>,
+    ) -> Option<TcpPacketSink<E>> {
+        let _registry_guard = write_unpoisoned(&self.tcp_writer_registry_lock);
+        let current_writer_id = self
+            .tcp_writers
+            .get(remote_addr)
+            .map(|registered| registered.registration.writer_id)?;
+        if expected_writer_id.is_some_and(|expected| expected != current_writer_id) {
+            return None;
+        }
+        let (_, registered) = self.tcp_writers.remove(remote_addr)?;
+        let remote_ip = remote_addr.ip();
+        let remove_ip_entry =
+            if let Some(mut registrations) = self.tcp_writer_addrs_by_ip.get_mut(&remote_ip) {
+                registrations.retain(|item| item != &registered.registration);
+                registrations.is_empty()
+            } else {
+                false
+            };
+        if remove_ip_entry {
+            self.tcp_writer_addrs_by_ip.remove(&remote_ip);
+        }
+        Some(registered.sink)
     }
 
     pub fn has_tcp_writer(&self, remote_addr: &SocketAddr) -> bool {
@@ -778,13 +878,17 @@ where
     async fn close(&self) -> GlobalResult<()> {
         self.closed.cancel();
 
-        let sinks = self
-            .tcp_writers
-            .iter()
-            .map(|entry| entry.value().clone())
-            .collect::<Vec<_>>();
-        self.tcp_writers.clear();
-        self.tcp_writer_addrs_by_ip.clear();
+        let sinks = {
+            let _registry_guard = write_unpoisoned(&self.tcp_writer_registry_lock);
+            let sinks = self
+                .tcp_writers
+                .iter()
+                .map(|entry| entry.value().sink.clone())
+                .collect::<Vec<_>>();
+            self.tcp_writers.clear();
+            self.tcp_writer_addrs_by_ip.clear();
+            sinks
+        };
 
         let mut close_error = None;
         for sink in sinks {
@@ -806,6 +910,21 @@ where
 
 fn packet_writer_closed() -> GlobalError {
     GlobalError::new_sys_error("packet writer is closed", |_| {})
+}
+
+fn lock_unpoisoned<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn read_unpoisoned<T>(lock: &StdRwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn write_unpoisoned<T>(lock: &StdRwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    lock.write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Aggregated result of stopping all tasks owned by a managed network endpoint.
@@ -837,11 +956,15 @@ struct ManagedTcpConnectionInner<E>
 where
     E: PacketEncoder,
 {
+    connection_id: u64,
     local_addr: SocketAddr,
     remote_addr: SocketAddr,
     writer: PacketWriter<E>,
     cancel: CancellationToken,
     close_state: Mutex<ManagedTcpConnectionCloseState>,
+    owner_registered: AtomicBool,
+    owner_connections: Weak<StdMutex<HashMap<u64, ManagedTcpConnection<E>>>>,
+    owner_report: Weak<StdMutex<NetworkCloseReport>>,
 }
 
 impl<E> Drop for ManagedTcpConnectionInner<E>
@@ -896,7 +1019,10 @@ where
     pub async fn close_and_wait(&self) -> GlobalResult<NetworkCloseReport> {
         let mut state = self.inner.close_state.lock().await;
         if state.completed {
-            return close_report_result(state.report.clone(), false);
+            let report = state.report.clone();
+            drop(state);
+            self.finalize_owner(&report);
+            return close_report_result(report, false);
         }
 
         self.inner.cancel.cancel();
@@ -924,7 +1050,27 @@ where
         if !state.report.is_complete() {
             state.failure_logged = true;
         }
-        close_report_result(state.report.clone(), log_failure)
+        let report = state.report.clone();
+        drop(state);
+        self.finalize_owner(&report);
+        close_report_result(report, log_failure)
+    }
+
+    fn finalize_owner(&self, report: &NetworkCloseReport) {
+        if self.inner.owner_registered.swap(false, Ordering::AcqRel) {
+            if let Some(owner_report) = self.inner.owner_report.upgrade() {
+                lock_unpoisoned(&owner_report).merge_network(report.clone());
+            }
+            if let Some(owner_connections) = self.inner.owner_connections.upgrade() {
+                lock_unpoisoned(&owner_connections).remove(&self.inner.connection_id);
+            }
+        }
+    }
+
+    fn task_is_finished(&self) -> bool {
+        self.inner.close_state.try_lock().is_ok_and(|state| {
+            state.completed || state.task.as_ref().is_none_or(JoinHandle::is_finished)
+        })
     }
 }
 
@@ -970,13 +1116,8 @@ impl ManagedTaskReport {
     }
 }
 
-struct ManagedCloseState<E>
-where
-    E: PacketEncoder,
-{
+struct ManagedCloseState {
     root_task: Option<JoinHandle<ManagedTaskReport>>,
-    active_connections: Vec<ManagedTcpConnection<E>>,
-    active_connections_closed: usize,
     report: NetworkCloseReport,
     writer_closed: bool,
     completed: bool,
@@ -994,8 +1135,22 @@ where
 {
     writer: PacketWriter<E>,
     cancel: CancellationToken,
-    connect_lock: Mutex<()>,
-    close_state: Mutex<ManagedCloseState<E>>,
+    connecting_tcp_peers: StdMutex<HashSet<SocketAddr>>,
+    active_connections: Arc<StdMutex<HashMap<u64, ManagedTcpConnection<E>>>>,
+    completed_connection_report: Arc<StdMutex<NetworkCloseReport>>,
+    next_connection_id: AtomicU64,
+    close_state: Mutex<ManagedCloseState>,
+}
+
+struct TcpConnectReservation<'a> {
+    remote_addr: SocketAddr,
+    connecting_tcp_peers: &'a StdMutex<HashSet<SocketAddr>>,
+}
+
+impl Drop for TcpConnectReservation<'_> {
+    fn drop(&mut self) {
+        lock_unpoisoned(self.connecting_tcp_peers).remove(&self.remote_addr);
+    }
 }
 
 impl<E> ManagedPacketIo<E>
@@ -1005,6 +1160,40 @@ where
     /// Returns a clone of the writer bound to this managed endpoint.
     pub fn writer(&self) -> PacketWriter<E> {
         self.writer.clone()
+    }
+
+    fn reserve_tcp_connect(
+        &self,
+        remote_addr: SocketAddr,
+    ) -> GlobalResult<TcpConnectReservation<'_>> {
+        let mut connecting_tcp_peers = lock_unpoisoned(&self.connecting_tcp_peers);
+        if self.writer.has_tcp_writer(&remote_addr) || !connecting_tcp_peers.insert(remote_addr) {
+            return Err(GlobalError::new_sys_error(
+                "managed tcp connection already exists",
+                |msg| debug!("{msg}: remote_addr={remote_addr}"),
+            ));
+        }
+        drop(connecting_tcp_peers);
+        Ok(TcpConnectReservation {
+            remote_addr,
+            connecting_tcp_peers: &self.connecting_tcp_peers,
+        })
+    }
+
+    async fn reap_finished_connections(&self) {
+        let finished = lock_unpoisoned(&self.active_connections)
+            .values()
+            .filter(|connection| connection.task_is_finished())
+            .cloned()
+            .collect::<Vec<_>>();
+        for connection in finished {
+            if let Err(error) = connection.close_and_wait().await {
+                debug!(
+                    "finished managed tcp connection reaped with failure: remote_addr={}, error={error}",
+                    connection.remote_addr()
+                );
+            }
+        }
     }
 
     /// Actively connects a TCP peer and registers its read/write tasks with this endpoint.
@@ -1044,16 +1233,11 @@ where
             ));
         }
 
-        let _connect_guard = self.connect_lock.lock().await;
         if self.cancel.is_cancelled() {
             return Err(managed_tcp_connect_cancelled(options.remote_addr));
         }
-        if self.writer.has_tcp_writer(&options.remote_addr) {
-            return Err(GlobalError::new_sys_error(
-                "managed tcp connection already exists",
-                |msg| debug!("{msg}: remote_addr={}", options.remote_addr),
-            ));
-        }
+        let _connect_reservation = self.reserve_tcp_connect(options.remote_addr)?;
+        self.reap_finished_connections().await;
 
         let socket = if options.remote_addr.is_ipv4() {
             TcpSocket::new_v4()
@@ -1102,8 +1286,10 @@ where
                 Some(ready_tx),
             ),
         )?;
+        let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
         let connection = ManagedTcpConnection {
             inner: Arc::new(ManagedTcpConnectionInner {
+                connection_id,
                 local_addr,
                 remote_addr: options.remote_addr,
                 writer: self.writer.clone(),
@@ -1114,6 +1300,9 @@ where
                     completed: false,
                     failure_logged: false,
                 }),
+                owner_registered: AtomicBool::new(false),
+                owner_connections: Arc::downgrade(&self.active_connections),
+                owner_report: Arc::downgrade(&self.completed_connection_report),
             }),
         };
 
@@ -1123,17 +1312,31 @@ where
             ready = ready_rx => ready.is_ok(),
         };
         if !ready {
-            let _ = connection.close_and_wait().await;
+            if let Err(error) = connection.close_and_wait().await {
+                debug!(
+                    "unready managed tcp connection close failed: remote_addr={}, error={error}",
+                    options.remote_addr
+                );
+            }
             return Err(managed_tcp_connect_cancelled(options.remote_addr));
         }
 
-        let mut state = self.close_state.lock().await;
+        let state = self.close_state.lock().await;
         if self.cancel.is_cancelled() || state.completed {
             drop(state);
-            let _ = connection.close_and_wait().await;
+            if let Err(error) = connection.close_and_wait().await {
+                debug!(
+                    "late managed tcp connection close failed: remote_addr={}, error={error}",
+                    options.remote_addr
+                );
+            }
             return Err(managed_tcp_connect_cancelled(options.remote_addr));
         }
-        state.active_connections.push(connection.clone());
+        connection
+            .inner
+            .owner_registered
+            .store(true, Ordering::Release);
+        lock_unpoisoned(&self.active_connections).insert(connection_id, connection.clone());
         Ok(connection)
     }
 
@@ -1157,15 +1360,26 @@ where
             }
         }
 
-        while state.active_connections_closed < state.active_connections.len() {
-            let index = state.active_connections_closed;
-            let connection_result = state.active_connections[index].close_and_wait().await;
-            match connection_result {
-                Ok(report) => state.report.merge_network(report),
-                Err(_) => state.report.failed += 1,
+        loop {
+            let active_connections = lock_unpoisoned(&self.active_connections)
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            if active_connections.is_empty() {
+                break;
             }
-            state.active_connections_closed += 1;
+            for connection in active_connections {
+                if let Err(error) = connection.close_and_wait().await {
+                    debug!(
+                        "owned managed tcp connection close failed: remote_addr={}, error={error}",
+                        connection.remote_addr()
+                    );
+                }
+            }
         }
+        let completed_connection_report =
+            std::mem::take(&mut *lock_unpoisoned(&self.completed_connection_report));
+        state.report.merge_network(completed_connection_report);
 
         let root_result = match state.root_task.as_mut() {
             Some(root_task) => Some(root_task.await),
@@ -1316,11 +1530,12 @@ where
     Ok(ManagedPacketIo {
         writer,
         cancel,
-        connect_lock: Mutex::new(()),
+        connecting_tcp_peers: StdMutex::new(HashSet::new()),
+        active_connections: Arc::new(StdMutex::new(HashMap::new())),
+        completed_connection_report: Arc::new(StdMutex::new(NetworkCloseReport::default())),
+        next_connection_id: AtomicU64::new(1),
         close_state: Mutex::new(ManagedCloseState {
             root_task: Some(root_task),
-            active_connections: Vec::new(),
-            active_connections_closed: 0,
             report: NetworkCloseReport::default(),
             writer_closed: false,
             completed: false,
@@ -1477,6 +1692,7 @@ where
     let listener = tokio::net::TcpListener::from_std(tcp).hand_log(|msg| error!("{msg}"))?;
 
     tokio::spawn(async move {
+        let mut accept_error_backoff = std::time::Duration::ZERO;
         loop {
             select! {
                 biased;
@@ -1484,6 +1700,7 @@ where
                 res = listener.accept() => {
                     match res {
                         Ok((stream, remote_addr)) => {
+                            accept_error_backoff = std::time::Duration::ZERO;
                             let dispatcher = dispatcher.clone();
                             let cancel = cancel.clone();
 
@@ -1495,7 +1712,16 @@ where
                             });
                         }
                         Err(e) => {
-                            error!("accept failed: {e}");
+                            accept_error_backoff = next_accept_error_backoff(accept_error_backoff);
+                            warn!(
+                                "accept failed; retrying after {:?}: {e}",
+                                accept_error_backoff
+                            );
+                            select! {
+                                biased;
+                                _ = cancel.cancelled() => break,
+                                _ = tokio::time::sleep(accept_error_backoff) => {}
+                            }
                         }
                     }
                 }
@@ -1521,6 +1747,7 @@ where
     let listener = tokio::net::TcpListener::from_std(tcp).hand_log(|msg| error!("{msg}"))?;
 
     tokio::spawn(async move {
+        let mut accept_error_backoff = std::time::Duration::ZERO;
         loop {
             select! {
                 biased;
@@ -1528,6 +1755,7 @@ where
                 res = listener.accept() => {
                     match res {
                         Ok((stream, remote_addr)) => {
+                            accept_error_backoff = std::time::Duration::ZERO;
                             let dispatcher = dispatcher.clone();
                             let cancel = cancel.clone();
 
@@ -1539,7 +1767,16 @@ where
                             });
                         }
                         Err(e) => {
-                            error!("accept failed: {e}");
+                            accept_error_backoff = next_accept_error_backoff(accept_error_backoff);
+                            warn!(
+                                "accept failed; retrying after {:?}: {e}",
+                                accept_error_backoff
+                            );
+                            select! {
+                                biased;
+                                _ = cancel.cancelled() => break,
+                                _ = tokio::time::sleep(accept_error_backoff) => {}
+                            }
                         }
                     }
                 }
@@ -1618,6 +1855,7 @@ where
 {
     let mut report = ManagedTaskReport::default();
     let mut connections = JoinSet::new();
+    let mut accept_error_backoff = std::time::Duration::ZERO;
 
     loop {
         select! {
@@ -1637,6 +1875,7 @@ where
             accepted = tcp_listener.accept() => {
                 match accepted {
                     Ok((stream, remote_addr)) if !cancel.is_cancelled() => {
+                        accept_error_backoff = std::time::Duration::ZERO;
                         connections.spawn(run_managed_tcp_connection::<D, S, E>(
                             stream,
                             remote_addr,
@@ -1648,8 +1887,19 @@ where
                     }
                     Ok(_) => break,
                     Err(error) => {
-                        report.failed += 1;
-                        debug!("tcp accept failed: {error}");
+                        accept_error_backoff = next_accept_error_backoff(accept_error_backoff);
+                        warn!(
+                            "tcp accept failed; retrying after {:?}: {error}",
+                            accept_error_backoff
+                        );
+                        select! {
+                            biased;
+                            _ = cancel.cancelled() => {
+                                report.cancelled += 1;
+                                break;
+                            }
+                            _ = tokio::time::sleep(accept_error_backoff) => {}
+                        }
                     }
                 }
             }
@@ -1663,6 +1913,14 @@ where
     report
 }
 
+fn next_accept_error_backoff(current: std::time::Duration) -> std::time::Duration {
+    if current.is_zero() {
+        TCP_ACCEPT_ERROR_BACKOFF_MIN
+    } else {
+        current.saturating_mul(2).min(TCP_ACCEPT_ERROR_BACKOFF_MAX)
+    }
+}
+
 async fn run_udp_receiver<D>(
     udp_socket: Arc<UdpSocket>,
     cancel: CancellationToken,
@@ -1672,8 +1930,8 @@ where
     D: PacketDispatcher,
 {
     let mut report = ManagedTaskReport::default();
+    let mut receive_buf = vec![0u8; UDP_MAX_DATAGRAM_SIZE];
     loop {
-        let mut buf = BytesMut::with_capacity(UDP_RECV_BUF_SIZE);
         select! {
             biased;
 
@@ -1682,10 +1940,10 @@ where
                 break;
             }
 
-            received = udp_socket_read_owned_buf(&mut buf, udp_socket.as_ref()) => {
+            received = udp_socket_read_owned_buf(&mut receive_buf, udp_socket.as_ref()) => {
                 match received {
                     Ok((size, remote_addr)) if size != 0 => {
-                        let packet = buf.split_to(size).freeze();
+                        let packet = Bytes::copy_from_slice(&receive_buf[..size]);
                         if let Err(error) = dispatcher.dispatch_owned(
                             packet,
                             remote_addr,
@@ -1739,7 +1997,11 @@ where
     match writer.tcp_write_mode().queue_size() {
         Some(queue_size) => {
             let (tx, rx) = mpsc::channel(queue_size);
-            writer.insert_tcp_writer(remote_addr, tx, cancel.clone());
+            let Some(registration) =
+                writer.insert_registered_tcp_writer(remote_addr, tx, cancel.clone())
+            else {
+                return Err(packet_writer_closed());
+            };
             if let Some(ready) = ready {
                 let _ = ready.send(());
             }
@@ -1751,14 +2013,19 @@ where
                     dispatcher,
                     S::default(),
                     writer.clone(),
+                    registration,
                 ),
-                handle_tcp_write::<E>(write_half, remote_addr, cancel, rx, writer),
+                handle_tcp_write::<E>(write_half, remote_addr, cancel, rx, writer, registration,),
             );
             read_result?;
             write_result
         }
         None => {
-            writer.insert_direct_tcp_writer(remote_addr, write_half, cancel.clone());
+            let Some(registration) =
+                writer.insert_registered_direct_tcp_writer(remote_addr, write_half, cancel.clone())
+            else {
+                return Err(packet_writer_closed());
+            };
             if let Some(ready) = ready {
                 let _ = ready.send(());
             }
@@ -1769,6 +2036,7 @@ where
                 dispatcher,
                 S::default(),
                 writer,
+                registration,
             )
             .await
         }
@@ -1885,6 +2153,7 @@ async fn handle_tcp_read_owned_half<D, S, E>(
     dispatcher: Arc<D>,
     mut splitter: S,
     writer: PacketWriter<E>,
+    registration: TcpWriterRegistration,
 ) -> GlobalResult<()>
 where
     D: PacketDispatcher,
@@ -1915,7 +2184,7 @@ where
             _ = cancel.cancelled() => break,
         }
     }
-    writer.remove_tcp_writer(&remote_addr);
+    writer.remove_registered_tcp_writer(registration);
     dispatcher.close(remote_addr, Protocol::TCP)?;
     Ok(())
 }
@@ -1926,6 +2195,7 @@ async fn handle_tcp_write<E>(
     cancel: CancellationToken,
     mut rx: mpsc::Receiver<EncodedPacket>,
     writer: PacketWriter<E>,
+    registration: TcpWriterRegistration,
 ) -> GlobalResult<()>
 where
     E: PacketEncoder,
@@ -1945,7 +2215,7 @@ where
         }
     }
     cancel.cancel();
-    writer.remove_tcp_writer(&remote_addr);
+    writer.remove_registered_tcp_writer(registration);
     stream
         .shutdown()
         .await
@@ -2042,13 +2312,13 @@ where
     let socket = UdpSocket::from_std(udp).hand_log(|msg| debug!("{msg}"))?;
 
     tokio::spawn(async move {
+        let mut receive_buf = vec![0u8; UDP_MAX_DATAGRAM_SIZE];
         loop {
-            let mut buf = BytesMut::with_capacity(UDP_RECV_BUF_SIZE);
             select! {
-                res = udp_socket_read_owned_buf(&mut buf, &socket) => {
+                res = udp_socket_read_owned_buf(&mut receive_buf, &socket) => {
                     match res {
                         Ok((n,addr)) if n != 0 => {
-                            let pkt = buf.split_to(n).freeze();
+                            let pkt = Bytes::copy_from_slice(&receive_buf[..n]);
                             if let Err(err) = dispatcher.dispatch_owned(pkt, addr, Protocol::UDP) {
                                 debug!("udp dispatch {addr} failed: {err}");
                             }
@@ -2070,11 +2340,11 @@ where
 }
 
 async fn udp_socket_read_owned_buf(
-    buf: &mut BytesMut,
+    buf: &mut [u8],
     socket: &UdpSocket,
 ) -> GlobalResult<(usize, SocketAddr)> {
     socket
-        .recv_buf_from(buf)
+        .recv_from(buf)
         .await
         .hand_log(|msg| error!("read buf failed:{msg}"))
 }
@@ -2085,6 +2355,7 @@ mod tests {
         handle_tcp_write, into_tokio_udp_socket, managed_rw_with_tcp_write_mode, ManagedCloseState,
         ManagedPacketIo, ManagedTaskReport, ManagedTcpConnectOptions, NetworkCloseReport,
         PacketDispatcher, PacketSplitter, PacketWriter, RawPacketEncoder, TcpWriteMode,
+        TcpWriterRegistration, TCP_ACCEPT_ERROR_BACKOFF_MAX, TCP_ACCEPT_ERROR_BACKOFF_MIN,
     };
     use crate::net::state::Protocol;
     use crate::tokio;
@@ -2118,6 +2389,7 @@ mod tests {
     #[derive(Default)]
     struct TestDispatcher {
         udp_packets: AtomicUsize,
+        udp_bytes: AtomicUsize,
         tcp_packets: AtomicUsize,
         tcp_closes: AtomicUsize,
     }
@@ -2125,12 +2397,13 @@ mod tests {
     impl PacketDispatcher for TestDispatcher {
         fn dispatch_owned(
             &self,
-            _data: Bytes,
+            data: Bytes,
             _remote_addr: SocketAddr,
             protocol: Protocol,
         ) -> GlobalResult<()> {
             if protocol == Protocol::UDP {
                 self.udp_packets.fetch_add(1, Ordering::Relaxed);
+                self.udp_bytes.fetch_add(data.len(), Ordering::Relaxed);
             } else if protocol == Protocol::TCP {
                 self.tcp_packets.fetch_add(1, Ordering::Relaxed);
             }
@@ -2167,6 +2440,72 @@ mod tests {
         assert_eq!(crate::inline_prefix!(be, 0x0102030405060708u64).len(), 8);
     }
 
+    #[test]
+    fn tcp_accept_error_backoff_is_bounded() {
+        let first = super::next_accept_error_backoff(Duration::ZERO);
+        assert_eq!(first, TCP_ACCEPT_ERROR_BACKOFF_MIN);
+        assert_eq!(super::next_accept_error_backoff(first), first * 2);
+
+        let mut backoff = first;
+        for _ in 0..32 {
+            backoff = super::next_accept_error_backoff(backoff);
+        }
+        assert_eq!(backoff, TCP_ACCEPT_ERROR_BACKOFF_MAX);
+    }
+
+    #[tokio::test]
+    async fn tcp_writer_generation_and_same_ip_fallback_preserve_live_sinks() {
+        let writer = PacketWriter::new(
+            None,
+            Arc::new(RawPacketEncoder),
+            TcpWriteMode::Queued { queue_size: 4 },
+        );
+        let first_addr: SocketAddr = "127.0.0.1:31001".parse().unwrap();
+        let second_addr: SocketAddr = "127.0.0.1:31002".parse().unwrap();
+        let first_cancel = CancellationToken::new();
+        let second_cancel = CancellationToken::new();
+        let replacement_cancel = CancellationToken::new();
+        let (first_tx, _first_rx) = mpsc::channel(1);
+        let (second_tx, _second_rx) = mpsc::channel(1);
+        let (replacement_tx, _replacement_rx) = mpsc::channel(1);
+
+        let first = writer
+            .insert_registered_tcp_writer(first_addr, first_tx, first_cancel.clone())
+            .unwrap();
+        let second = writer
+            .insert_registered_tcp_writer(second_addr, second_tx, second_cancel.clone())
+            .unwrap();
+        assert_eq!(
+            writer
+                .tcp_sink_by_ip(first_addr.ip())
+                .unwrap()
+                .remote_addr(),
+            second_addr
+        );
+
+        writer.remove_registered_tcp_writer(second);
+        assert!(second_cancel.is_cancelled());
+        assert_eq!(
+            writer
+                .tcp_sink_by_ip(first_addr.ip())
+                .unwrap()
+                .remote_addr(),
+            first_addr
+        );
+
+        let replacement = writer
+            .insert_registered_tcp_writer(first_addr, replacement_tx, replacement_cancel.clone())
+            .unwrap();
+        assert!(first_cancel.is_cancelled());
+        writer.remove_registered_tcp_writer(first);
+        assert!(writer.has_tcp_writer(&first_addr));
+        assert!(!replacement_cancel.is_cancelled());
+
+        writer.remove_registered_tcp_writer(replacement);
+        assert!(!writer.has_tcp_writer(&first_addr));
+        assert!(replacement_cancel.is_cancelled());
+    }
+
     #[tokio::test]
     async fn tcp_write_task_exit_cancels_connection() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2180,9 +2519,19 @@ mod tests {
         let (tx, rx) = mpsc::channel(1);
         drop(tx);
 
-        handle_tcp_write(write_half, remote_addr, cancel.clone(), rx, writer)
-            .await
-            .unwrap();
+        handle_tcp_write(
+            write_half,
+            remote_addr,
+            cancel.clone(),
+            rx,
+            writer,
+            TcpWriterRegistration {
+                remote_addr,
+                writer_id: 1,
+            },
+        )
+        .await
+        .unwrap();
 
         assert!(cancel.is_cancelled());
         drop(client);
@@ -2206,6 +2555,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn managed_udp_receiver_preserves_large_datagram() {
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let local_addr = udp.local_addr().unwrap();
+        let dispatcher = Arc::new(TestDispatcher::default());
+        let managed =
+            managed_rw_with_tcp_write_mode::<TestDispatcher, DrainSplitter, RawPacketEncoder>(
+                &GlobalRuntime::get_main_runtime(),
+                format!("managed-large-udp-{local_addr}"),
+                (None, Some(udp)),
+                CancellationToken::new(),
+                dispatcher.clone(),
+                Arc::new(RawPacketEncoder),
+                TcpWriteMode::Direct,
+            )
+            .unwrap();
+        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let payload = vec![0x5a; 60_000];
+
+        assert_eq!(
+            sender.send_to(&payload, local_addr).await.unwrap(),
+            payload.len()
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while dispatcher.udp_packets.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(dispatcher.udp_packets.load(Ordering::Relaxed), 1);
+        assert_eq!(dispatcher.udp_bytes.load(Ordering::Relaxed), payload.len());
+        managed.close_and_wait().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn managed_close_resumes_after_waiter_timeout() {
         let release = Arc::new(Notify::new());
         let task_release = release.clone();
@@ -2219,11 +2604,14 @@ mod tests {
         let managed = ManagedPacketIo {
             writer: PacketWriter::new(None, Arc::new(RawPacketEncoder), TcpWriteMode::Direct),
             cancel: CancellationToken::new(),
-            connect_lock: Mutex::new(()),
+            connecting_tcp_peers: std::sync::Mutex::new(std::collections::HashSet::new()),
+            active_connections: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            completed_connection_report: Arc::new(std::sync::Mutex::new(
+                NetworkCloseReport::default(),
+            )),
+            next_connection_id: std::sync::atomic::AtomicU64::new(1),
             close_state: Mutex::new(ManagedCloseState {
                 root_task: Some(root_task),
-                active_connections: Vec::new(),
-                active_connections_closed: 0,
                 report: NetworkCloseReport::default(),
                 writer_closed: false,
                 completed: false,
@@ -2364,6 +2752,7 @@ mod tests {
             let second = connection.close_and_wait().await.unwrap();
             assert_eq!(first, second);
             assert!(first.is_complete());
+            assert!(super::lock_unpoisoned(&managed.active_connections).is_empty());
             assert!(!managed.writer().has_tcp_writer(&remote_addr));
             assert_eq!(dispatcher.tcp_closes.load(Ordering::Relaxed), 1);
             assert!(managed.close_and_wait().await.unwrap().is_complete());
@@ -2441,6 +2830,140 @@ mod tests {
             .await
             .is_err());
         refused.close_and_wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn managed_tcp_connect_reservations_are_scoped_per_remote_peer() {
+        let dispatcher = Arc::new(TestDispatcher::default());
+        let managed =
+            managed_rw_with_tcp_write_mode::<TestDispatcher, DrainSplitter, RawPacketEncoder>(
+                &GlobalRuntime::get_main_runtime(),
+                "managed-connect-reservation-scope",
+                (None, None),
+                CancellationToken::new(),
+                dispatcher,
+                Arc::new(RawPacketEncoder),
+                TcpWriteMode::Direct,
+            )
+            .unwrap();
+        let first: SocketAddr = "127.0.0.1:32001".parse().unwrap();
+        let second: SocketAddr = "127.0.0.1:32002".parse().unwrap();
+
+        let first_reservation = managed.reserve_tcp_connect(first).unwrap();
+        assert!(managed.reserve_tcp_connect(first).is_err());
+        let second_reservation = managed.reserve_tcp_connect(second).unwrap();
+        assert_eq!(
+            super::lock_unpoisoned(&managed.connecting_tcp_peers).len(),
+            2
+        );
+
+        drop((first_reservation, second_reservation));
+        assert!(super::lock_unpoisoned(&managed.connecting_tcp_peers).is_empty());
+        managed.close_and_wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn managed_active_tcp_closed_handles_do_not_accumulate() {
+        let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote_addr = server.local_addr().unwrap();
+        let dispatcher = Arc::new(TestDispatcher::default());
+        let managed =
+            managed_rw_with_tcp_write_mode::<TestDispatcher, DrainSplitter, RawPacketEncoder>(
+                &GlobalRuntime::get_main_runtime(),
+                format!("managed-active-reconnect-{remote_addr}"),
+                (None, None),
+                CancellationToken::new(),
+                dispatcher.clone(),
+                Arc::new(RawPacketEncoder),
+                TcpWriteMode::Direct,
+            )
+            .unwrap();
+
+        for attempt in 0..16 {
+            let connection = managed
+                .connect_tcp::<TestDispatcher, DrainSplitter>(
+                    &GlobalRuntime::get_main_runtime(),
+                    format!("managed-active-reconnect-{remote_addr}-{attempt}"),
+                    ManagedTcpConnectOptions {
+                        remote_addr,
+                        local_addr: None,
+                        timeout: Duration::from_secs(1),
+                    },
+                    dispatcher.clone(),
+                )
+                .await
+                .unwrap();
+            let (peer, _) = server.accept().await.unwrap();
+
+            connection.close_and_wait().await.unwrap();
+            assert!(super::lock_unpoisoned(&managed.active_connections).is_empty());
+            drop(peer);
+        }
+
+        let report = managed.close_and_wait().await.unwrap();
+        assert!(report.is_complete());
+        assert_eq!(report.completed, 17);
+    }
+
+    #[tokio::test]
+    async fn managed_active_tcp_reaps_naturally_finished_handle_before_reconnect() {
+        let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote_addr = server.local_addr().unwrap();
+        let dispatcher = Arc::new(TestDispatcher::default());
+        let managed =
+            managed_rw_with_tcp_write_mode::<TestDispatcher, DrainSplitter, RawPacketEncoder>(
+                &GlobalRuntime::get_main_runtime(),
+                format!("managed-active-natural-reap-{remote_addr}"),
+                (None, None),
+                CancellationToken::new(),
+                dispatcher.clone(),
+                Arc::new(RawPacketEncoder),
+                TcpWriteMode::Direct,
+            )
+            .unwrap();
+        let options = ManagedTcpConnectOptions {
+            remote_addr,
+            local_addr: None,
+            timeout: Duration::from_secs(1),
+        };
+
+        let first = managed
+            .connect_tcp::<TestDispatcher, DrainSplitter>(
+                &GlobalRuntime::get_main_runtime(),
+                "managed-active-natural-reap-first",
+                options,
+                dispatcher.clone(),
+            )
+            .await
+            .unwrap();
+        let (first_peer, _) = server.accept().await.unwrap();
+        drop(first_peer);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !first.task_is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(super::lock_unpoisoned(&managed.active_connections).len(), 1);
+
+        let second = managed
+            .connect_tcp::<TestDispatcher, DrainSplitter>(
+                &GlobalRuntime::get_main_runtime(),
+                "managed-active-natural-reap-second",
+                options,
+                dispatcher,
+            )
+            .await
+            .unwrap();
+        let (second_peer, _) = server.accept().await.unwrap();
+        assert_eq!(super::lock_unpoisoned(&managed.active_connections).len(), 1);
+        assert!(first.close_and_wait().await.unwrap().is_complete());
+
+        second.close_and_wait().await.unwrap();
+        drop(second_peer);
+        assert!(super::lock_unpoisoned(&managed.active_connections).is_empty());
+        assert!(managed.close_and_wait().await.unwrap().is_complete());
     }
 
     #[tokio::test]
