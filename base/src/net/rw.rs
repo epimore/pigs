@@ -9,10 +9,10 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 use tokio::select;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, oneshot, Mutex, Notify, RwLock};
 use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
@@ -494,6 +494,7 @@ where
     udp_socket: Arc<RwLock<Option<Arc<UdpSocket>>>>,
     tcp_writers: Arc<DashMap<SocketAddr, TcpPacketSink<E>>>,
     tcp_writer_addrs_by_ip: Arc<DashMap<IpAddr, SocketAddr>>,
+    tcp_writer_ready: Arc<Notify>,
     encoder: Arc<E>,
     tcp_write_mode: TcpWriteMode,
     closed: CancellationToken,
@@ -508,6 +509,7 @@ where
             udp_socket: self.udp_socket.clone(),
             tcp_writers: self.tcp_writers.clone(),
             tcp_writer_addrs_by_ip: self.tcp_writer_addrs_by_ip.clone(),
+            tcp_writer_ready: self.tcp_writer_ready.clone(),
             encoder: self.encoder.clone(),
             tcp_write_mode: self.tcp_write_mode,
             closed: self.closed.clone(),
@@ -528,6 +530,7 @@ where
             udp_socket: Arc::new(RwLock::new(udp_socket)),
             tcp_writers: Arc::new(DashMap::new()),
             tcp_writer_addrs_by_ip: Arc::new(DashMap::new()),
+            tcp_writer_ready: Arc::new(Notify::new()),
             encoder,
             tcp_write_mode,
             closed: CancellationToken::new(),
@@ -661,6 +664,43 @@ where
         self.tcp_sink(&remote_addr)
     }
 
+    /// Waits until the exact TCP peer writer is registered or the deadline/endpoint closes.
+    pub async fn wait_tcp_sink(
+        &self,
+        remote_addr: SocketAddr,
+        timeout: std::time::Duration,
+    ) -> GlobalResult<TcpPacketSink<E>> {
+        if timeout.is_zero() {
+            return Err(GlobalError::new_sys_error(
+                "tcp writer wait timeout must be greater than zero",
+                |msg| debug!("{msg}: remote_addr={remote_addr}"),
+            ));
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            self.ensure_open()?;
+            if let Some(sink) = self.tcp_sink(&remote_addr) {
+                return Ok(sink);
+            }
+            let notified = self.tcp_writer_ready.notified();
+            if let Some(sink) = self.tcp_sink(&remote_addr) {
+                return Ok(sink);
+            }
+            select! {
+                biased;
+                _ = self.closed.cancelled() => return Err(packet_writer_closed()),
+                result = tokio::time::timeout_at(deadline, notified) => {
+                    if result.is_err() {
+                        return Err(GlobalError::new_sys_error(
+                            "tcp writer wait timed out",
+                            |msg| debug!("{msg}: remote_addr={remote_addr}"),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     fn tcp_sink_or_err(&self, remote_addr: SocketAddr) -> GlobalResult<TcpPacketSink<E>> {
         self.tcp_sink(&remote_addr).ok_or_else(|| {
             GlobalError::new_sys_error("tcp writer is not available", |msg| {
@@ -707,6 +747,7 @@ where
         self.tcp_writer_addrs_by_ip
             .insert(remote_addr.ip(), remote_addr);
         self.tcp_writers.insert(remote_addr, sink);
+        self.tcp_writer_ready.notify_waiters();
     }
 
     pub fn remove_tcp_writer(&self, remote_addr: &SocketAddr) {
@@ -777,6 +818,116 @@ pub struct NetworkCloseReport {
     pub remaining: usize,
 }
 
+/// Connection parameters for a TCP peer actively opened by a managed endpoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ManagedTcpConnectOptions {
+    pub remote_addr: SocketAddr,
+    pub local_addr: Option<SocketAddr>,
+    pub timeout: std::time::Duration,
+}
+
+struct ManagedTcpConnectionCloseState {
+    task: Option<JoinHandle<GlobalResult<()>>>,
+    report: NetworkCloseReport,
+    completed: bool,
+    failure_logged: bool,
+}
+
+struct ManagedTcpConnectionInner<E>
+where
+    E: PacketEncoder,
+{
+    local_addr: SocketAddr,
+    remote_addr: SocketAddr,
+    writer: PacketWriter<E>,
+    cancel: CancellationToken,
+    close_state: Mutex<ManagedTcpConnectionCloseState>,
+}
+
+impl<E> Drop for ManagedTcpConnectionInner<E>
+where
+    E: PacketEncoder,
+{
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+/// A managed active TCP connection registered with a [`ManagedPacketIo`] endpoint.
+#[must_use = "managed TCP connection must be retained and closed explicitly"]
+pub struct ManagedTcpConnection<E = RawPacketEncoder>
+where
+    E: PacketEncoder,
+{
+    inner: Arc<ManagedTcpConnectionInner<E>>,
+}
+
+impl<E> Clone for ManagedTcpConnection<E>
+where
+    E: PacketEncoder,
+{
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<E> ManagedTcpConnection<E>
+where
+    E: PacketEncoder,
+{
+    pub fn local_addr(&self) -> SocketAddr {
+        self.inner.local_addr
+    }
+
+    pub fn remote_addr(&self) -> SocketAddr {
+        self.inner.remote_addr
+    }
+
+    pub async fn write(&self, data: Bytes) -> GlobalResult<()> {
+        self.inner
+            .writer
+            .write_to(data, self.inner.remote_addr, Protocol::TCP)
+            .await
+    }
+
+    /// Cancels this connection and waits for its read/write tasks to exit.
+    pub async fn close_and_wait(&self) -> GlobalResult<NetworkCloseReport> {
+        let mut state = self.inner.close_state.lock().await;
+        if state.completed {
+            return close_report_result(state.report.clone(), false);
+        }
+
+        self.inner.cancel.cancel();
+        let task_result = match state.task.as_mut() {
+            Some(task) => Some(task.await),
+            None => None,
+        };
+        if let Some(task_result) = task_result {
+            state.task.take();
+            match task_result {
+                Ok(Ok(())) => state.report.completed += 1,
+                Ok(Err(error)) => {
+                    state.report.failed += 1;
+                    debug!(
+                        "managed active tcp connection failed: remote_addr={}, error={error}",
+                        self.inner.remote_addr
+                    );
+                }
+                Err(join_error) => record_join_error(&mut state.report, join_error),
+            }
+        }
+
+        state.completed = true;
+        let log_failure = !state.failure_logged;
+        if !state.report.is_complete() {
+            state.failure_logged = true;
+        }
+        close_report_result(state.report.clone(), log_failure)
+    }
+}
+
 impl NetworkCloseReport {
     /// Returns `true` when every owned task reached a terminal state without failure.
     pub fn is_complete(&self) -> bool {
@@ -784,6 +935,14 @@ impl NetworkCloseReport {
     }
 
     fn merge(&mut self, other: ManagedTaskReport) {
+        self.completed += other.completed;
+        self.cancelled += other.cancelled;
+        self.failed += other.failed;
+        self.panicked += other.panicked;
+        self.remaining += other.remaining;
+    }
+
+    fn merge_network(&mut self, other: Self) {
         self.completed += other.completed;
         self.cancelled += other.cancelled;
         self.failed += other.failed;
@@ -811,8 +970,13 @@ impl ManagedTaskReport {
     }
 }
 
-struct ManagedCloseState {
+struct ManagedCloseState<E>
+where
+    E: PacketEncoder,
+{
     root_task: Option<JoinHandle<ManagedTaskReport>>,
+    active_connections: Vec<ManagedTcpConnection<E>>,
+    active_connections_closed: usize,
     report: NetworkCloseReport,
     writer_closed: bool,
     completed: bool,
@@ -830,7 +994,8 @@ where
 {
     writer: PacketWriter<E>,
     cancel: CancellationToken,
-    close_state: Mutex<ManagedCloseState>,
+    connect_lock: Mutex<()>,
+    close_state: Mutex<ManagedCloseState<E>>,
 }
 
 impl<E> ManagedPacketIo<E>
@@ -840,6 +1005,136 @@ where
     /// Returns a clone of the writer bound to this managed endpoint.
     pub fn writer(&self) -> PacketWriter<E> {
         self.writer.clone()
+    }
+
+    /// Actively connects a TCP peer and registers its read/write tasks with this endpoint.
+    ///
+    /// The returned handle is READY: the exact remote-address writer is installed before this
+    /// method completes. The connection shares endpoint cancellation and is also awaited by
+    /// [`ManagedPacketIo::close_and_wait`].
+    pub async fn connect_tcp<D, S>(
+        &self,
+        runtime: &GlobalRuntime,
+        task_name: impl Into<String>,
+        options: ManagedTcpConnectOptions,
+        dispatcher: Arc<D>,
+    ) -> GlobalResult<ManagedTcpConnection<E>>
+    where
+        D: PacketDispatcher,
+        S: PacketSplitter + Default,
+    {
+        if options.timeout.is_zero() {
+            return Err(GlobalError::new_sys_error(
+                "managed tcp connect timeout must be greater than zero",
+                |msg| debug!("{msg}: remote_addr={}", options.remote_addr),
+            ));
+        }
+        if options
+            .local_addr
+            .is_some_and(|local| local.is_ipv4() != options.remote_addr.is_ipv4())
+        {
+            return Err(GlobalError::new_sys_error(
+                "managed tcp local and remote address families differ",
+                |msg| {
+                    debug!(
+                        "{msg}: local_addr={:?}, remote_addr={}",
+                        options.local_addr, options.remote_addr
+                    )
+                },
+            ));
+        }
+
+        let _connect_guard = self.connect_lock.lock().await;
+        if self.cancel.is_cancelled() {
+            return Err(managed_tcp_connect_cancelled(options.remote_addr));
+        }
+        if self.writer.has_tcp_writer(&options.remote_addr) {
+            return Err(GlobalError::new_sys_error(
+                "managed tcp connection already exists",
+                |msg| debug!("{msg}: remote_addr={}", options.remote_addr),
+            ));
+        }
+
+        let socket = if options.remote_addr.is_ipv4() {
+            TcpSocket::new_v4()
+        } else {
+            TcpSocket::new_v6()
+        }
+        .hand_log(|msg| debug!("{msg}: remote_addr={}", options.remote_addr))?;
+        if let Some(local_addr) = options.local_addr {
+            socket
+                .bind(local_addr)
+                .hand_log(|msg| debug!("{msg}: local_addr={local_addr}"))?;
+        }
+
+        let stream = select! {
+            biased;
+            _ = self.cancel.cancelled() => {
+                return Err(managed_tcp_connect_cancelled(options.remote_addr));
+            }
+            result = tokio::time::timeout(options.timeout, socket.connect(options.remote_addr)) => {
+                match result {
+                    Ok(result) => result.hand_log(|msg| {
+                        debug!("{msg}: remote_addr={}", options.remote_addr)
+                    })?,
+                    Err(_) => {
+                        return Err(GlobalError::new_sys_error(
+                            "managed tcp connect timed out",
+                            |msg| debug!("{msg}: remote_addr={}", options.remote_addr),
+                        ));
+                    }
+                }
+            }
+        };
+        let local_addr = stream
+            .local_addr()
+            .hand_log(|msg| debug!("{msg}: remote_addr={}", options.remote_addr))?;
+        let cancel = self.cancel.child_token();
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let task = runtime.spawn(
+            task_name,
+            run_managed_tcp_connection::<D, S, E>(
+                stream,
+                options.remote_addr,
+                cancel.clone(),
+                dispatcher,
+                self.writer.clone(),
+                Some(ready_tx),
+            ),
+        )?;
+        let connection = ManagedTcpConnection {
+            inner: Arc::new(ManagedTcpConnectionInner {
+                local_addr,
+                remote_addr: options.remote_addr,
+                writer: self.writer.clone(),
+                cancel,
+                close_state: Mutex::new(ManagedTcpConnectionCloseState {
+                    task: Some(task),
+                    report: NetworkCloseReport::default(),
+                    completed: false,
+                    failure_logged: false,
+                }),
+            }),
+        };
+
+        let ready = select! {
+            biased;
+            _ = self.cancel.cancelled() => false,
+            ready = ready_rx => ready.is_ok(),
+        };
+        if !ready {
+            let _ = connection.close_and_wait().await;
+            return Err(managed_tcp_connect_cancelled(options.remote_addr));
+        }
+
+        let mut state = self.close_state.lock().await;
+        if self.cancel.is_cancelled() || state.completed {
+            drop(state);
+            let _ = connection.close_and_wait().await;
+            return Err(managed_tcp_connect_cancelled(options.remote_addr));
+        }
+        state.active_connections.push(connection.clone());
+        Ok(connection)
     }
 
     /// Cancels all owned work and waits until the writer and protocol tasks are closed.
@@ -862,6 +1157,16 @@ where
             }
         }
 
+        while state.active_connections_closed < state.active_connections.len() {
+            let index = state.active_connections_closed;
+            let connection_result = state.active_connections[index].close_and_wait().await;
+            match connection_result {
+                Ok(report) => state.report.merge_network(report),
+                Err(_) => state.report.failed += 1,
+            }
+            state.active_connections_closed += 1;
+        }
+
         let root_result = match state.root_task.as_mut() {
             Some(root_task) => Some(root_task.await),
             None => None,
@@ -881,6 +1186,12 @@ where
         }
         close_report_result(state.report.clone(), log_failure)
     }
+}
+
+fn managed_tcp_connect_cancelled(remote_addr: SocketAddr) -> GlobalError {
+    GlobalError::new_sys_error("managed tcp connect cancelled", |msg| {
+        debug!("{msg}: remote_addr={remote_addr}")
+    })
 }
 
 impl<E> Drop for ManagedPacketIo<E>
@@ -1005,8 +1316,11 @@ where
     Ok(ManagedPacketIo {
         writer,
         cancel,
+        connect_lock: Mutex::new(()),
         close_state: Mutex::new(ManagedCloseState {
             root_task: Some(root_task),
+            active_connections: Vec::new(),
+            active_connections_closed: 0,
             report: NetworkCloseReport::default(),
             writer_closed: false,
             completed: false,
@@ -1329,6 +1643,7 @@ where
                             cancel.child_token(),
                             dispatcher.clone(),
                             writer.clone(),
+                            None,
                         ));
                     }
                     Ok(_) => break,
@@ -1413,6 +1728,7 @@ async fn run_managed_tcp_connection<D, S, E>(
     cancel: CancellationToken,
     dispatcher: Arc<D>,
     writer: PacketWriter<E>,
+    ready: Option<oneshot::Sender<()>>,
 ) -> GlobalResult<()>
 where
     D: PacketDispatcher,
@@ -1424,6 +1740,9 @@ where
         Some(queue_size) => {
             let (tx, rx) = mpsc::channel(queue_size);
             writer.insert_tcp_writer(remote_addr, tx, cancel.clone());
+            if let Some(ready) = ready {
+                let _ = ready.send(());
+            }
             let (read_result, write_result) = tokio::join!(
                 handle_tcp_read_owned_half::<D, S, E>(
                     read_half,
@@ -1440,6 +1759,9 @@ where
         }
         None => {
             writer.insert_direct_tcp_writer(remote_addr, write_half, cancel.clone());
+            if let Some(ready) = ready {
+                let _ = ready.send(());
+            }
             handle_tcp_read_owned_half::<D, S, E>(
                 read_half,
                 remote_addr,
@@ -1761,8 +2083,8 @@ async fn udp_socket_read_owned_buf(
 mod tests {
     use super::{
         handle_tcp_write, into_tokio_udp_socket, managed_rw_with_tcp_write_mode, ManagedCloseState,
-        ManagedPacketIo, ManagedTaskReport, NetworkCloseReport, PacketDispatcher, PacketSplitter,
-        PacketWriter, RawPacketEncoder, TcpWriteMode,
+        ManagedPacketIo, ManagedTaskReport, ManagedTcpConnectOptions, NetworkCloseReport,
+        PacketDispatcher, PacketSplitter, PacketWriter, RawPacketEncoder, TcpWriteMode,
     };
     use crate::net::state::Protocol;
     use crate::tokio;
@@ -1796,6 +2118,7 @@ mod tests {
     #[derive(Default)]
     struct TestDispatcher {
         udp_packets: AtomicUsize,
+        tcp_packets: AtomicUsize,
         tcp_closes: AtomicUsize,
     }
 
@@ -1808,6 +2131,8 @@ mod tests {
         ) -> GlobalResult<()> {
             if protocol == Protocol::UDP {
                 self.udp_packets.fetch_add(1, Ordering::Relaxed);
+            } else if protocol == Protocol::TCP {
+                self.tcp_packets.fetch_add(1, Ordering::Relaxed);
             }
             Ok(())
         }
@@ -1894,8 +2219,11 @@ mod tests {
         let managed = ManagedPacketIo {
             writer: PacketWriter::new(None, Arc::new(RawPacketEncoder), TcpWriteMode::Direct),
             cancel: CancellationToken::new(),
+            connect_lock: Mutex::new(()),
             close_state: Mutex::new(ManagedCloseState {
                 root_task: Some(root_task),
+                active_connections: Vec::new(),
+                active_connections_closed: 0,
                 report: NetworkCloseReport::default(),
                 writer_closed: false,
                 completed: false,
@@ -1965,6 +2293,266 @@ mod tests {
         let rebound_tcp = std::net::TcpListener::bind(local_addr).unwrap();
         let rebound_udp = std::net::UdpSocket::bind(local_addr).unwrap();
         drop((rebound_tcp, rebound_udp));
+    }
+
+    #[tokio::test]
+    async fn managed_active_tcp_is_ready_for_exact_read_write_and_local_bind() {
+        for (name, write_mode) in [
+            ("queued", TcpWriteMode::Queued { queue_size: 4 }),
+            ("direct", TcpWriteMode::Direct),
+        ] {
+            let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let remote_addr = server.local_addr().unwrap();
+            let local_reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let local_addr = local_reservation.local_addr().unwrap();
+            drop(local_reservation);
+            let dispatcher = Arc::new(TestDispatcher::default());
+            let managed =
+                managed_rw_with_tcp_write_mode::<TestDispatcher, DrainSplitter, RawPacketEncoder>(
+                    &GlobalRuntime::get_main_runtime(),
+                    format!("managed-active-connect-{name}-{remote_addr}"),
+                    (None, None),
+                    CancellationToken::new(),
+                    dispatcher.clone(),
+                    Arc::new(RawPacketEncoder),
+                    write_mode,
+                )
+                .unwrap();
+
+            let connection = managed
+                .connect_tcp::<TestDispatcher, DrainSplitter>(
+                    &GlobalRuntime::get_main_runtime(),
+                    format!("managed-active-peer-{name}-{remote_addr}"),
+                    ManagedTcpConnectOptions {
+                        remote_addr,
+                        local_addr: Some(local_addr),
+                        timeout: Duration::from_secs(1),
+                    },
+                    dispatcher.clone(),
+                )
+                .await
+                .unwrap();
+            let (mut peer, peer_addr) = server.accept().await.unwrap();
+            assert_eq!(connection.local_addr(), local_addr);
+            assert_eq!(connection.remote_addr(), remote_addr);
+            assert_eq!(peer_addr, local_addr);
+            assert!(managed.writer().has_tcp_writer(&remote_addr));
+            assert!(managed
+                .writer()
+                .wait_tcp_sink(remote_addr, Duration::from_secs(1))
+                .await
+                .is_ok());
+
+            connection
+                .write(Bytes::from_static(b"outbound"))
+                .await
+                .unwrap();
+            let mut outbound = [0u8; 8];
+            peer.read_exact(&mut outbound).await.unwrap();
+            assert_eq!(&outbound, b"outbound");
+
+            peer.write_all(b"inbound").await.unwrap();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while dispatcher.tcp_packets.load(Ordering::Relaxed) == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+
+            let first = connection.close_and_wait().await.unwrap();
+            let second = connection.close_and_wait().await.unwrap();
+            assert_eq!(first, second);
+            assert!(first.is_complete());
+            assert!(!managed.writer().has_tcp_writer(&remote_addr));
+            assert_eq!(dispatcher.tcp_closes.load(Ordering::Relaxed), 1);
+            assert!(managed.close_and_wait().await.unwrap().is_complete());
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_active_tcp_rejects_duplicate_peer_and_refused_connection() {
+        let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote_addr = server.local_addr().unwrap();
+        let dispatcher = Arc::new(TestDispatcher::default());
+        let managed =
+            managed_rw_with_tcp_write_mode::<TestDispatcher, DrainSplitter, RawPacketEncoder>(
+                &GlobalRuntime::get_main_runtime(),
+                format!("managed-active-duplicate-{remote_addr}"),
+                (None, None),
+                CancellationToken::new(),
+                dispatcher.clone(),
+                Arc::new(RawPacketEncoder),
+                TcpWriteMode::Direct,
+            )
+            .unwrap();
+        let options = ManagedTcpConnectOptions {
+            remote_addr,
+            local_addr: None,
+            timeout: Duration::from_secs(1),
+        };
+        let connection = managed
+            .connect_tcp::<TestDispatcher, DrainSplitter>(
+                &GlobalRuntime::get_main_runtime(),
+                format!("managed-active-duplicate-peer-{remote_addr}"),
+                options,
+                dispatcher.clone(),
+            )
+            .await
+            .unwrap();
+        let (_peer, _) = server.accept().await.unwrap();
+        assert!(managed
+            .connect_tcp::<TestDispatcher, DrainSplitter>(
+                &GlobalRuntime::get_main_runtime(),
+                "managed-active-duplicate-rejected",
+                options,
+                dispatcher.clone(),
+            )
+            .await
+            .is_err());
+        connection.close_and_wait().await.unwrap();
+        managed.close_and_wait().await.unwrap();
+
+        let refused_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let refused_addr = refused_listener.local_addr().unwrap();
+        drop(refused_listener);
+        let refused =
+            managed_rw_with_tcp_write_mode::<TestDispatcher, DrainSplitter, RawPacketEncoder>(
+                &GlobalRuntime::get_main_runtime(),
+                format!("managed-active-refused-{refused_addr}"),
+                (None, None),
+                CancellationToken::new(),
+                dispatcher.clone(),
+                Arc::new(RawPacketEncoder),
+                TcpWriteMode::Direct,
+            )
+            .unwrap();
+        assert!(refused
+            .connect_tcp::<TestDispatcher, DrainSplitter>(
+                &GlobalRuntime::get_main_runtime(),
+                "managed-active-refused-peer",
+                ManagedTcpConnectOptions {
+                    remote_addr: refused_addr,
+                    local_addr: None,
+                    timeout: Duration::from_secs(1),
+                },
+                dispatcher,
+            )
+            .await
+            .is_err());
+        refused.close_and_wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn managed_active_tcp_honors_pre_cancel_and_timeout_validation() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let dispatcher = Arc::new(TestDispatcher::default());
+        let managed =
+            managed_rw_with_tcp_write_mode::<TestDispatcher, DrainSplitter, RawPacketEncoder>(
+                &GlobalRuntime::get_main_runtime(),
+                "managed-active-pre-cancelled",
+                (None, None),
+                cancel,
+                dispatcher.clone(),
+                Arc::new(RawPacketEncoder),
+                TcpWriteMode::Direct,
+            )
+            .unwrap();
+        let remote_addr = "127.0.0.1:9".parse().unwrap();
+        assert!(managed
+            .connect_tcp::<TestDispatcher, DrainSplitter>(
+                &GlobalRuntime::get_main_runtime(),
+                "managed-active-pre-cancelled-peer",
+                ManagedTcpConnectOptions {
+                    remote_addr,
+                    local_addr: None,
+                    timeout: Duration::from_secs(1),
+                },
+                dispatcher.clone(),
+            )
+            .await
+            .is_err());
+        assert!(managed
+            .connect_tcp::<TestDispatcher, DrainSplitter>(
+                &GlobalRuntime::get_main_runtime(),
+                "managed-active-zero-timeout",
+                ManagedTcpConnectOptions {
+                    remote_addr,
+                    local_addr: None,
+                    timeout: Duration::ZERO,
+                },
+                dispatcher,
+            )
+            .await
+            .is_err());
+        managed.close_and_wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn packet_writer_waits_for_exact_peer_and_times_out_without_one() {
+        let dispatcher = Arc::new(TestDispatcher::default());
+        let managed =
+            managed_rw_with_tcp_write_mode::<TestDispatcher, DrainSplitter, RawPacketEncoder>(
+                &GlobalRuntime::get_main_runtime(),
+                "managed-wait-exact-peer",
+                (
+                    Some(std::net::TcpListener::bind("127.0.0.1:0").unwrap()),
+                    None,
+                ),
+                CancellationToken::new(),
+                dispatcher,
+                Arc::new(RawPacketEncoder),
+                TcpWriteMode::Direct,
+            )
+            .unwrap();
+        let absent = "127.0.0.1:9".parse().unwrap();
+        assert!(managed
+            .writer()
+            .wait_tcp_sink(absent, Duration::from_millis(10))
+            .await
+            .is_err());
+        managed.close_and_wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn managed_endpoint_close_waits_for_active_tcp_connection() {
+        let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote_addr = server.local_addr().unwrap();
+        let dispatcher = Arc::new(TestDispatcher::default());
+        let managed =
+            managed_rw_with_tcp_write_mode::<TestDispatcher, DrainSplitter, RawPacketEncoder>(
+                &GlobalRuntime::get_main_runtime(),
+                format!("managed-active-owner-{remote_addr}"),
+                (None, None),
+                CancellationToken::new(),
+                dispatcher.clone(),
+                Arc::new(RawPacketEncoder),
+                TcpWriteMode::Direct,
+            )
+            .unwrap();
+        let connection = managed
+            .connect_tcp::<TestDispatcher, DrainSplitter>(
+                &GlobalRuntime::get_main_runtime(),
+                format!("managed-active-owned-peer-{remote_addr}"),
+                ManagedTcpConnectOptions {
+                    remote_addr,
+                    local_addr: None,
+                    timeout: Duration::from_secs(1),
+                },
+                dispatcher.clone(),
+            )
+            .await
+            .unwrap();
+        let (mut peer, _) = server.accept().await.unwrap();
+
+        let report = managed.close_and_wait().await.unwrap();
+        assert!(report.is_complete());
+        assert!(report.completed >= 2, "{report:?}");
+        assert_eq!(connection.close_and_wait().await.unwrap().completed, 1);
+        assert_eq!(dispatcher.tcp_closes.load(Ordering::Relaxed), 1);
+        let mut byte = [0u8; 1];
+        assert_eq!(peer.read(&mut byte).await.unwrap(), 0);
     }
 
     #[tokio::test]
