@@ -19,6 +19,7 @@ pub mod episode;
 /// log:
 ///   level: warn #全局日志等级 可选：默认 info
 ///   stdout: true #是否输出到控制台；可选：默认 true
+///   file: true #是否输出到日志文件；可选：默认 true
 ///   prefix: server #全局日志文件前缀; 可选：默认 app 指定生成日志文件添加日期后缀，如 server_2024-10-26.log
 ///   store_path: ./logs #日志文件根目录；可选 默认 当前目录
 ///   specify: #指定日志输出 可选，不指定则默认输出到全局日志里
@@ -44,11 +45,14 @@ pub struct Logger {
     level: String,
     #[serde(default = "default_stdout")]
     stdout: bool,
+    #[serde(default = "default_file")]
+    file: bool,
     specify: Option<Vec<Specify>>,
 }
 serde_default!(default_prefix, String, "app".to_string());
 serde_default!(default_level, String, "info".to_string());
 serde_default!(default_stdout, bool, true);
+serde_default!(default_file, bool, true);
 
 #[derive(Debug, Deserialize)]
 pub struct Specify {
@@ -78,8 +82,10 @@ impl Logger {
             log.store_path
         };
 
-        std::fs::create_dir_all(&store_path)
-            .hand_log(|msg| error!("create log dir failed: {msg}"))?;
+        if log.file {
+            std::fs::create_dir_all(&store_path)
+                .hand_log(|msg| error!("create log dir failed: {msg}"))?;
+        }
 
         // 基础 formatter
         let colors = ColoredLevelConfig::new()
@@ -131,10 +137,12 @@ impl Logger {
                         file_logger = file_logger.chain(std::io::stdout());
                     }
 
-                    file_logger = file_logger.chain(fern::DateBased::new(
-                        &store_path,
-                        format!("{}_{}.log", file_prefix, "%Y-%m-%d"),
-                    ));
+                    if log.file {
+                        file_logger = file_logger.chain(fern::DateBased::new(
+                            &store_path,
+                            format!("{}_{}.log", file_prefix, "%Y-%m-%d"),
+                        ));
+                    }
 
                     dispatch = dispatch.chain(file_logger);
                 } else {
@@ -157,10 +165,12 @@ impl Logger {
             main_logger = main_logger.chain(std::io::stdout());
         }
 
-        main_logger = main_logger.chain(fern::DateBased::new(
-            &store_path,
-            format!("{}_{}.log", log.prefix, "%Y-%m-%d"),
-        ));
+        if log.file {
+            main_logger = main_logger.chain(fern::DateBased::new(
+                &store_path,
+                format!("{}_{}.log", log.prefix, "%Y-%m-%d"),
+            ));
+        }
 
         dispatch = dispatch.chain(main_logger);
 
@@ -262,7 +272,23 @@ where
 mod tests {
     use log::LevelFilter;
 
-    use super::{display_source_file, effective_level, parse_targets, LogRule};
+    use super::{display_source_file, effective_level, parse_targets, LogRule, Logger};
+
+    #[test]
+    fn file_output_defaults_to_enabled() {
+        let logger: Logger = serde_yaml::from_str("level: info\nstdout: true\n").unwrap();
+
+        assert!(logger.file);
+    }
+
+    #[test]
+    fn file_output_can_be_disabled() {
+        let logger: Logger =
+            serde_yaml::from_str("level: info\nstdout: true\nfile: false\n").unwrap();
+
+        assert!(!logger.file);
+        assert!(logger.stdout);
+    }
 
     #[test]
     fn shortens_absolute_source_paths() {

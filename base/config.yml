@@ -1,6 +1,7 @@
 log:
   level: debug #默认日志等级
   stdout: true #默认日志是否输出到控制台
+  file: true #默认写入日志文件
   prefix: server #默认日志文件前缀; eg:server_2024-10-26.log
   store_path: ./logs
   specify: #指定日志输出
