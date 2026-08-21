@@ -192,7 +192,7 @@ fn parse_targets(crate_name: &str) -> Vec<String> {
         .collect()
 }
 
-fn display_source_file(file: &str) -> Cow<'_, str> {
+pub(crate) fn display_source_file(file: &str) -> Cow<'_, str> {
     let windows_absolute =
         file.starts_with("\\\\") || matches!(file.as_bytes(), [_, b':', b'\\' | b'/', ..]);
     if !file.starts_with('/') && !windows_absolute {
@@ -201,14 +201,14 @@ fn display_source_file(file: &str) -> Cow<'_, str> {
 
     if file.contains('\\') {
         let normalized = file.replace('\\', "/");
-        return Cow::Owned(
-            trim_source_root(&normalized)
-                .unwrap_or(&normalized)
-                .to_string(),
-        );
+        return Cow::Owned(shorten_absolute_source_file(&normalized).to_string());
     }
 
-    Cow::Borrowed(trim_source_root(file).unwrap_or(file))
+    Cow::Borrowed(shorten_absolute_source_file(file))
+}
+
+fn shorten_absolute_source_file(file: &str) -> &str {
+    trim_source_root(file).unwrap_or_else(|| file.rsplit('/').next().unwrap_or(file))
 }
 
 fn trim_source_root(file: &str) -> Option<&str> {
@@ -299,6 +299,14 @@ mod tests {
         assert_eq!(
             display_source_file(r"C:\code\epimore\gmv_pjsip\src\io.rs"),
             "gmv_pjsip/src/io.rs"
+        );
+        assert_eq!(
+            display_source_file("/tmp/build/target/debug/build/protocol/out/generated.rs"),
+            "generated.rs"
+        );
+        assert_eq!(
+            display_source_file(r"C:\build\target\generated.rs"),
+            "generated.rs"
         );
     }
 

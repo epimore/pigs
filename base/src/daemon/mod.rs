@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
+use std::process;
+use std::sync::Once;
 use std::{env, fs};
 
 //todo 优化，运行前检查是否已有进程运行：当前即使未再次运行成功也会重写meta数据
@@ -17,6 +19,46 @@ pub trait Daemon<T> {
     where
         Self: Sized;
     fn run_app(self, t: T) -> GlobalResult<()>;
+}
+
+pub fn install_sanitized_panic_hook() {
+    static INSTALL: Once = Once::new();
+
+    INSTALL.call_once(|| {
+        std::panic::set_hook(Box::new(|info| {
+            let current_thread = std::thread::current();
+            let thread_name = current_thread.name().unwrap_or("unnamed");
+            let message = if let Some(message) = info.payload().downcast_ref::<&str>() {
+                *message
+            } else if let Some(message) = info.payload().downcast_ref::<String>() {
+                message.as_str()
+            } else {
+                "Box<dyn Any>"
+            };
+
+            if let Some(location) = info.location() {
+                eprintln!(
+                    "thread '{thread_name}' panicked at {}:{}:{}:\n{message}",
+                    crate::logger::display_source_file(location.file()),
+                    location.line(),
+                    location.column(),
+                );
+            } else {
+                eprintln!("thread '{thread_name}' panicked:\n{message}");
+            }
+        }));
+    });
+}
+
+fn run_foreground<D, T>() -> Result<(), String>
+where
+    D: Daemon<T>,
+{
+    let (daemon, bootstrap) =
+        D::init_privilege().map_err(|error| format!("App init error: {error}"))?;
+    daemon
+        .run_app(bootstrap)
+        .map_err(|error| format!("App runtime error: {error}"))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -54,6 +96,7 @@ pub fn run<D, T>()
 where
     D: Daemon<T>,
 {
+    install_sanitized_panic_hook();
     let app_info = D::cli_basic();
     let arg_matches = cfg_lib::conf::get_arg_cmd(app_info);
     match arg_matches.subcommand() {
@@ -70,32 +113,19 @@ where
                 daemon,
             };
             meta.save_meta();
+            if daemon && (cfg!(target_os = "linux") || cfg!(target_os = "macos")) {
+                #[cfg(unix)]
+                {
+                    unix::start_service::<D, T>();
+                }
+                return;
+            }
             if daemon {
-                if cfg!(target_os = "linux") || cfg!(target_os = "macos") {
-                    #[cfg(unix)]
-                    {
-                        unix::start_service::<D, T>();
-                    }
-                } else {
-                    eprintln!("The daemon only supports macOS, and Linux");
-                    match D::init_privilege() {
-                        Ok((d, t)) => {
-                            d.run_app(t).expect("Failed to run app");
-                        }
-                        Err(err) => {
-                            panic!("App init error: {}", err);
-                        }
-                    }
-                }
-            } else {
-                match D::init_privilege() {
-                    Ok((d, t)) => {
-                        d.run_app(t).expect("Failed to run app");
-                    }
-                    Err(err) => {
-                        panic!("App init error: {}", err);
-                    }
-                }
+                eprintln!("The daemon only supports macOS, and Linux");
+            }
+            if let Err(error) = run_foreground::<D, T>() {
+                eprintln!("{error}");
+                process::exit(1);
             }
         }
         Some(("stop", _)) => {
@@ -143,5 +173,95 @@ where
         _other => {
             eprintln!("Please add subcommands to operate: [start|stop|restart]")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use exception::GlobalError;
+    use std::process::Command;
+
+    const PANIC_HELPER_ENV: &str = "BASE_SANITIZED_PANIC_HELPER";
+
+    struct InitFailure;
+
+    impl Daemon<()> for InitFailure {
+        fn cli_basic() -> CliBasic {
+            unreachable!()
+        }
+
+        fn init_privilege() -> GlobalResult<(Self, ())> {
+            Err(GlobalError::new_sys_error(
+                "bind session grpc 127.0.0.1:19081 failed: Address already in use (os error 98)",
+                |_| {},
+            ))
+        }
+
+        fn run_app(self, _bootstrap: ()) -> GlobalResult<()> {
+            unreachable!()
+        }
+    }
+
+    struct RuntimeFailure;
+
+    impl Daemon<()> for RuntimeFailure {
+        fn cli_basic() -> CliBasic {
+            unreachable!()
+        }
+
+        fn init_privilege() -> GlobalResult<(Self, ())> {
+            Ok((Self, ()))
+        }
+
+        fn run_app(self, _bootstrap: ()) -> GlobalResult<()> {
+            Err(GlobalError::new_sys_error("runtime stopped", |_| {}))
+        }
+    }
+
+    #[test]
+    fn foreground_init_error_preserves_diagnostics_without_source_path() {
+        let error = run_foreground::<InitFailure, ()>().unwrap_err();
+
+        assert_eq!(
+            error,
+            "App init error: bind session grpc 127.0.0.1:19081 failed: Address already in use (os error 98)"
+        );
+        assert!(!error.contains(env!("CARGO_MANIFEST_DIR")));
+    }
+
+    #[test]
+    fn foreground_runtime_error_is_returned_instead_of_panicking() {
+        assert_eq!(
+            run_foreground::<RuntimeFailure, ()>().unwrap_err(),
+            "App runtime error: runtime stopped"
+        );
+    }
+
+    #[test]
+    fn sanitized_panic_process_helper() {
+        if env::var_os(PANIC_HELPER_ENV).is_some() {
+            install_sanitized_panic_hook();
+            panic!("panic hook diagnostic");
+        }
+    }
+
+    #[test]
+    fn panic_output_hides_build_source_root() {
+        let output = Command::new(env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "daemon::tests::sanitized_panic_process_helper",
+                "--nocapture",
+            ])
+            .env(PANIC_HELPER_ENV, "1")
+            .output()
+            .expect("run panic hook helper");
+
+        assert!(!output.status.success());
+        let stderr = String::from_utf8(output.stderr).expect("panic output is UTF-8");
+        assert!(stderr.contains("panic hook diagnostic"));
+        assert!(stderr.contains("base/src/daemon/mod.rs:"));
+        assert!(!stderr.contains(env!("CARGO_MANIFEST_DIR")));
     }
 }
