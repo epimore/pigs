@@ -25,6 +25,7 @@ pub use serde_json;
 pub use serde_yaml;
 pub use sha2;
 
+pub mod artifact;
 pub mod bus;
 pub mod cache;
 pub mod daemon;

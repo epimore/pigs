@@ -16,7 +16,6 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixDatagram, UnixListener, UnixStream},
     sync::{mpsc, Mutex},
     task::JoinHandle,
@@ -25,7 +24,6 @@ use tokio_util::sync::CancellationToken;
 
 const DEFAULT_QUEUE_SIZE: usize = 128;
 const DEFAULT_MAX_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
-const READ_BUFFER_SIZE: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct UnixTransportConfig {
@@ -242,7 +240,16 @@ impl ManagedUnixStream {
         let task_cancel = cancel.clone();
         let root_task = runtime
             .spawn(task_name, async move {
-                run_stream(stream, decoder, outbound_rx, inbound_tx, task_cancel).await
+                super::framed_stream::run(
+                    stream,
+                    decoder,
+                    outbound_rx,
+                    inbound_tx,
+                    task_cancel,
+                    None,
+                    "Unix stream",
+                )
+                .await
             })
             .map_err(|error| {
                 TransportError::new(
@@ -501,7 +508,9 @@ impl MessageTransport for ManagedUnixDatagram {
             };
             let socket_path = match &self.endpoint.address {
                 TransportAddress::Unix(path) => path,
-                TransportAddress::Inet(_) => unreachable!("validated Unix datagram endpoint"),
+                TransportAddress::Inet(_) | TransportAddress::NamedPipe(_) => {
+                    unreachable!("validated Unix datagram endpoint")
+                }
             };
             let endpoint_removed = remove_owned_socket(socket_path, self.identity)?;
             Ok(TransportCloseReport {
@@ -520,68 +529,6 @@ impl Drop for ManagedUnixDatagram {
             let _ = remove_owned_socket(path, self.identity);
         }
     }
-}
-
-async fn run_stream(
-    stream: UnixStream,
-    decoder: LengthDelimitedCodec,
-    mut outbound: mpsc::Receiver<Bytes>,
-    inbound: mpsc::Sender<TransportMessage>,
-    cancel: CancellationToken,
-) -> TransportResult<()> {
-    let (mut reader, mut writer) = stream.into_split();
-    let read_cancel = cancel.clone();
-    let read_loop = async move {
-        let mut decoder = decoder;
-        let mut buffer = vec![0u8; READ_BUFFER_SIZE];
-        loop {
-            let read = tokio::select! {
-                _ = read_cancel.cancelled() => return Ok(()),
-                read = reader.read(&mut buffer) => read
-                    .map_err(|error| TransportError::from_io("read Unix stream", &error))?,
-            };
-            if read == 0 {
-                decoder.finish()?;
-                return Ok(());
-            }
-            for payload in decoder.push(&buffer[..read])? {
-                tokio::select! {
-                    _ = read_cancel.cancelled() => return Ok(()),
-                    sent = inbound.send(TransportMessage { payload, peer: None }) => {
-                        if sent.is_err() {
-                            return Ok(());
-                        }
-                    }
-                }
-            }
-        }
-    };
-    let write_cancel = cancel.clone();
-    let write_loop = async move {
-        loop {
-            let payload = tokio::select! {
-                _ = write_cancel.cancelled() => return Ok(()),
-                payload = outbound.recv() => match payload {
-                    Some(payload) => payload,
-                    None => return Ok(()),
-                }
-            };
-            writer
-                .write_all(&payload)
-                .await
-                .map_err(|error| TransportError::from_io("write Unix stream", &error))?;
-        }
-    };
-
-    tokio::pin!(read_loop);
-    tokio::pin!(write_loop);
-    let result = tokio::select! {
-        result = &mut read_loop => result,
-        result = &mut write_loop => result,
-        _ = cancel.cancelled() => Ok(()),
-    };
-    cancel.cancel();
-    result
 }
 
 async fn run_datagram(
@@ -753,7 +700,9 @@ async fn prepare_socket_path(
                 }
             }
         }
-        TransportKind::Udp | TransportKind::Tcp => unreachable!("Unix endpoint kind"),
+        TransportKind::Udp | TransportKind::Tcp | TransportKind::NamedPipe => {
+            unreachable!("Unix endpoint kind")
+        }
     };
     if active {
         return Err(TransportError::new(

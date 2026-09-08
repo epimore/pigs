@@ -16,6 +16,7 @@ pub enum TransportKind {
     Tcp,
     UnixDatagram,
     UnixStream,
+    NamedPipe,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +80,16 @@ impl TransportCapabilities {
                 max_message_size,
                 mode: TransportMode::Stream,
             },
+            TransportKind::NamedPipe => Self {
+                reliable: true,
+                ordered: true,
+                preserves_message_boundary: false,
+                encrypted: false,
+                congestion_controlled: true,
+                local_only: true,
+                max_message_size,
+                mode: TransportMode::Stream,
+            },
         }
     }
 }
@@ -87,6 +98,7 @@ impl TransportCapabilities {
 pub enum TransportAddress {
     Inet(SocketAddr),
     Unix(PathBuf),
+    NamedPipe(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,7 +122,7 @@ impl TransportEndpoint {
             ) | (
                 TransportKind::UnixDatagram | TransportKind::UnixStream,
                 TransportAddress::Unix(_)
-            )
+            ) | (TransportKind::NamedPipe, TransportAddress::NamedPipe(_))
         );
         if !valid {
             return Err(TransportError::new(
@@ -362,6 +374,13 @@ mod tests {
         assert!(uds.ordered);
         assert!(uds.local_only);
         assert!(!uds.preserves_message_boundary);
+
+        let pipe = TransportCapabilities::for_kind(TransportKind::NamedPipe, 4096);
+        assert_eq!(pipe.mode, TransportMode::Stream);
+        assert!(pipe.reliable);
+        assert!(pipe.ordered);
+        assert!(pipe.local_only);
+        assert!(!pipe.preserves_message_boundary);
     }
 
     #[test]
