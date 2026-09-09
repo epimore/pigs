@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "base",
     "base_db",
+    "base_mqtt",
     "base_rpc",
     "base_rpc_build",
     "exception",

@@ -1,0 +1,13 @@
+[package]
+name = "base_mqtt"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+
+[dependencies]
+base = { path = "../base" }
+rumqttc = "0.25.1"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
