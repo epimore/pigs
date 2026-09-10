@@ -8,6 +8,20 @@ pub mod retry;
 pub mod server;
 pub mod stream_supervisor;
 
+fn ensure_crypto_provider() -> Result<(), RpcError> {
+    if rustls::crypto::CryptoProvider::get_default().is_none()
+        && rustls::crypto::ring::default_provider()
+            .install_default()
+            .is_err()
+        && rustls::crypto::CryptoProvider::get_default().is_none()
+    {
+        return Err(RpcError::Connection(
+            "failed to install a process-level TLS crypto provider".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 pub use channel::{connect_channel, load_client_tls_from_files, rpc_endpoint_uri, rpc_scheme};
 pub use config::{
     ClientAuthMode, RpcChannelConfig, RpcClientTlsConfig, RpcServerConfig, RpcServerTlsConfig,

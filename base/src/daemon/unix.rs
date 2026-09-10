@@ -1,312 +1,318 @@
-use crate::daemon::Daemon;
+use crate::daemon::{CommandReport, Daemon};
 use crate::utils::rt::DAEMON_STOP_TIMEOUT_SECS;
 use chrono::{DateTime, NaiveDateTime};
 use daemonize::{Daemonize, Outcome};
-use std::fs::File;
-use std::io::Read;
-use std::process::{exit, Command};
+use exception::{GlobalError, GlobalResult};
+use std::fs;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant};
 use std::{env, thread};
 
-// ----------------------------
-// Helper: 读取 PID 文件
-// ----------------------------
-fn read_pid() -> Option<i32> {
-    let exe_path = env::current_exe().expect("Failed to get current executable path");
-    let pid_file_path = exe_path.with_extension("pid");
-    if let Ok(mut file) = File::open(pid_file_path) {
-        let mut pid_str = String::new();
-        file.read_to_string(&mut pid_str).expect("读取pid信息失败");
-        let pid = pid_str.trim().parse::<i32>().ok()?;
-        if pid > 0 {
-            Some(pid)
-        } else {
-            None
-        }
-    } else {
-        None
-    }
+fn pid_file_path() -> GlobalResult<PathBuf> {
+    env::current_exe()
+        .map(|path| path.with_extension("pid"))
+        .map_err(external_error)
 }
 
-// ----------------------------
-// Helper: 检查进程是否仍在运行
-// ----------------------------
-fn is_process_running(pid: i32) -> bool {
+fn read_pid() -> GlobalResult<Option<i32>> {
+    let path = pid_file_path()?;
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(external_error(error)),
+    };
+    let pid = content.trim().parse::<i32>().map_err(external_error)?;
     if pid <= 0 {
-        return false;
+        return Err(daemon_error("PID file contains a non-positive PID"));
     }
-    unsafe { libc::kill(pid, 0) == 0 }
+    Ok(Some(pid))
 }
 
-// ----------------------------
-// Helper: 删除 PID 文件（静默）
-// ----------------------------
-fn remove_pid_file() {
-    if let Ok(exe) = env::current_exe() {
-        let _ = std::fs::remove_file(exe.with_extension("pid"));
+fn process_exists(pid: i32) -> GlobalResult<bool> {
+    if pid <= 0 {
+        return Ok(false);
     }
-}
-
-// ----------------------------
-// 状态检查
-// ----------------------------
-pub(super) fn status_service() {
-    match read_pid() {
-        Some(pid) => {
-            if is_process_running(pid) {
-                println!("Service is running with PID: {}", pid);
-
-                // === 获取并格式化启动时间为 YYYY-MM-DD HH:MM:SS ===
-                let mut printed_start_time = false;
-                if let Ok(output) = Command::new("ps")
-                    .args(["-p", &pid.to_string(), "-o", "lstart="])
-                    .output()
-                {
-                    if output.status.success() {
-                        if let Ok(raw) = String::from_utf8(output.stdout) {
-                            let raw = raw.trim();
-                            if !raw.is_empty() {
-                                // 尝试解析并格式化
-                                if let Ok(friendly_time) =
-                                    format_start_time_friendly(&raw.replace("  ", " "))
-                                {
-                                    println!("Started at: {}", friendly_time);
-                                    printed_start_time = true;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // 如果解析失败，回退到原始输出（保持兼容）
-                if !printed_start_time {
-                    if let Ok(output) = Command::new("ps")
-                        .args(["-p", &pid.to_string(), "-o", "lstart="])
-                        .output()
-                    {
-                        if let Ok(raw) = String::from_utf8(output.stdout) {
-                            println!("Started at: {}", raw.trim());
-                        }
-                    }
-                }
-
-                // === Process info 表格===
-                if let Ok(output) = Command::new("ps")
-                    .arg("-p")
-                    .arg(pid.to_string())
-                    .arg("-o")
-                    .arg("user,%cpu,%mem,cmd")
-                    .output()
-                {
-                    let info = String::from_utf8_lossy(&output.stdout);
-                    let trimmed = info.trim();
-                    if !trimmed.is_empty() {
-                        // 移除首行 "PID ..." 中的 "PID" 前缀
-                        println!("Process info:\n{}", trimmed.trim_start_matches("PID"));
-                    }
-                }
-            } else {
-                println!(
-                    "Service PID file exists (PID {}) but process is not running",
-                    pid
-                );
-                println!("This may indicate a stale PID file. You can run 'stop' to clean it up.");
-            }
-        }
-        None => {
-            println!("Service is not running (no PID file found)");
-        }
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(false),
+        Some(libc::EPERM) => Ok(true),
+        _ => Err(external_error(error)),
     }
 }
 
-// ----------------------------
-// 将 ps 的 lstart 字符串转为 "2025-12-04 10:23:15"
-// ----------------------------
-fn format_start_time_friendly(s: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let formats = [
-        "%a %b %e %H:%M:%S %Y", // Thu Dec  4 18:25:03 2025 (注意这里的 %e 对于单数字日有前导空格)
-        "%a %b %d %H:%M:%S %Y", // Thu Dec 04 18:25:03 2025
-        "%b %e %H:%M",          // Dec  4 18:25 (无年份，适用于今年的进程)
-        "%b %d %H:%M",          // Dec 04 18:25 (无年份，适用于今年的进程)
-    ];
-    let mut parsed_datetime = None;
-    for format in &formats {
-        if let Ok(dt) = DateTime::parse_from_str(s, format) {
-            parsed_datetime = Some(dt);
-            break;
-        }
+fn remove_pid_file() -> GlobalResult<()> {
+    match fs::remove_file(pid_file_path()?) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(external_error(error)),
     }
+}
 
-    match parsed_datetime {
-        Some(dt) => {
-            // 转换为目标格式
-            Ok(dt.format("%Y-%m-%d %H:%M:%S").to_string())
-        }
-        None => {
-            // 尝试使用 NaiveDateTime 解析
-            if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%a %b %e %H:%M:%S %Y") {
-                Ok(dt.format("%Y-%m-%d %H:%M:%S").to_string())
-            } else {
-                Err("unsupported time format".into())
+#[cfg(target_os = "linux")]
+fn process_executable(pid: i32) -> GlobalResult<PathBuf> {
+    fs::read_link(format!("/proc/{pid}/exe")).map_err(external_error)
+}
+
+#[cfg(target_os = "macos")]
+fn process_executable(pid: i32) -> GlobalResult<PathBuf> {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+        .map_err(external_error)?;
+    if !output.status.success() {
+        return Err(daemon_error("query process executable failed"));
+    }
+    let path = String::from_utf8(output.stdout).map_err(external_error)?;
+    let path = path.trim();
+    if path.is_empty() {
+        return Err(daemon_error("process executable is unavailable"));
+    }
+    Ok(PathBuf::from(path))
+}
+
+fn canonicalize_existing(path: &Path) -> GlobalResult<PathBuf> {
+    fs::canonicalize(path).map_err(external_error)
+}
+
+fn verify_process_identity(pid: i32) -> GlobalResult<()> {
+    let expected = canonicalize_existing(&env::current_exe().map_err(external_error)?)?;
+    let actual = canonicalize_existing(&process_executable(pid)?)?;
+    if actual != expected {
+        return Err(daemon_error(&format!(
+            "PID {pid} belongs to a different executable; refusing to signal it"
+        )));
+    }
+    Ok(())
+}
+
+pub(super) fn status_service() -> GlobalResult<CommandReport> {
+    let Some(pid) = read_pid()? else {
+        return Ok(CommandReport::line(
+            "Service is not running (no PID file found)",
+        ));
+    };
+    if !process_exists(pid)? {
+        return Ok(CommandReport::line(format!(
+            "Service PID file is stale (PID {pid} is not running)"
+        )));
+    }
+    verify_process_identity(pid)?;
+    let mut report = CommandReport::line(format!("Service is running with PID: {pid}"));
+    if let Ok(output) = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "lstart="])
+        .output()
+    {
+        if output.status.success() {
+            let raw = String::from_utf8_lossy(&output.stdout);
+            let raw = raw.trim().replace("  ", " ");
+            if !raw.is_empty() {
+                let start = format_start_time_friendly(&raw).unwrap_or(raw);
+                report.push(format!("Started at: {start}"));
             }
         }
     }
+    if let Ok(output) = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "user,%cpu,%mem,cmd"])
+        .output()
+    {
+        if output.status.success() {
+            let info = String::from_utf8_lossy(&output.stdout);
+            let info = info.trim();
+            if !info.is_empty() {
+                report.push(format!("Process info:\n{}", info.trim_start_matches("PID")));
+            }
+        }
+    }
+    Ok(report)
 }
 
-// ----------------------------
-// 启动服务
-// ----------------------------
-pub(super) fn start_service<D, T>()
+fn format_start_time_friendly(value: &str) -> Option<String> {
+    for format in [
+        "%a %b %e %H:%M:%S %Y",
+        "%a %b %d %H:%M:%S %Y",
+        "%b %e %H:%M",
+        "%b %d %H:%M",
+    ] {
+        if let Ok(datetime) = DateTime::parse_from_str(value, format) {
+            return Some(datetime.format("%Y-%m-%d %H:%M:%S").to_string());
+        }
+    }
+    NaiveDateTime::parse_from_str(value, "%a %b %e %H:%M:%S %Y")
+        .ok()
+        .map(|datetime| datetime.format("%Y-%m-%d %H:%M:%S").to_string())
+}
+
+pub(super) fn start_service<D, T>() -> GlobalResult<CommandReport>
 where
     D: Daemon<T>,
 {
-    // 检查是否已在运行
-    if let Some(pid) = read_pid() {
-        if is_process_running(pid) {
-            eprintln!("Service already running with PID {}", pid);
-            exit(1);
-        } else {
-            eprintln!(
-                "Stale PID file found (PID {} not running). Removing...",
-                pid
-            );
-            remove_pid_file();
+    if let Some(pid) = read_pid()? {
+        if process_exists(pid)? {
+            verify_process_identity(pid)?;
+            return Err(daemon_error(&format!(
+                "service is already running with PID {pid}"
+            )));
         }
+        remove_pid_file()?;
     }
 
-    let exe_path = env::current_exe().expect("Failed to get current executable path");
-    let wd = exe_path.parent().expect("Invalid working directory");
-    let uid = users::get_current_uid();
-    let gid = users::get_current_gid();
-
+    let exe_path = env::current_exe().map_err(external_error)?;
+    let working_directory = exe_path
+        .parent()
+        .ok_or_else(|| daemon_error("service executable has no parent directory"))?;
     let daemonize = Daemonize::new()
         .pid_file(exe_path.with_extension("pid"))
         .chown_pid_file(true)
-        .working_directory(wd)
-        .user(uid)
-        .group(gid)
+        .working_directory(working_directory)
+        .user(users::get_current_uid())
+        .group(users::get_current_gid())
         .privileged_action(move || D::init_privilege());
 
     match daemonize.execute() {
-        Outcome::Child(Ok(child)) => match child.privileged_action_result {
-            Ok((d, t)) => {
-                if let Err(e) = d.run_app(t) {
-                    eprintln!("App runtime error: {}", e);
-                }
-            }
-            Err(err) => {
-                eprintln!("Privileged action failed: {}", err);
-            }
-        },
-        Outcome::Child(Err(err)) => {
-            eprintln!("Daemonize child error: {}", err);
+        Outcome::Child(Ok(child)) => {
+            let (daemon, bootstrap) = child.privileged_action_result?;
+            daemon.run_app(bootstrap)?;
+            Ok(CommandReport::default())
         }
-        Outcome::Parent(Err(err)) => {
-            eprintln!("Daemonize parent error: {}", err);
+        Outcome::Child(Err(error)) | Outcome::Parent(Err(error)) => Err(external_error(error)),
+        Outcome::Parent(Ok(parent)) if parent.first_child_exit_code == 0 => {
+            Ok(CommandReport::line("Service started successfully"))
         }
-        Outcome::Parent(Ok(parent)) => {
-            println!("... Successfully started");
-            exit(parent.first_child_exit_code);
-        }
+        Outcome::Parent(Ok(parent)) => Err(daemon_error(&format!(
+            "daemon child exited with code {}",
+            parent.first_child_exit_code
+        ))),
+    }
+}
+
+pub(super) fn stop_service() -> GlobalResult<CommandReport> {
+    stop_service_with_timeout(Duration::from_secs(DAEMON_STOP_TIMEOUT_SECS))
+}
+
+fn stop_service_with_timeout(timeout: Duration) -> GlobalResult<CommandReport> {
+    let Some(pid) = read_pid()? else {
+        return Ok(CommandReport::line("Service is not running (no PID file)"));
     };
+    if !process_exists(pid)? {
+        remove_pid_file()?;
+        return Ok(CommandReport::line(format!(
+            "Removed stale PID file for PID {pid}"
+        )));
+    }
+    verify_process_identity(pid)?;
+    send_signal(pid, libc::SIGTERM)?;
+    if wait_for_process_exit(pid, timeout)? {
+        remove_pid_file()?;
+        return Ok(CommandReport::line(format!(
+            "Service stopped after SIGTERM (PID {pid})"
+        )));
+    }
+    send_signal(pid, libc::SIGKILL)?;
+    if !wait_for_process_exit(pid, Duration::from_secs(2))? {
+        return Err(daemon_error(&format!("failed to kill service PID {pid}")));
+    }
+    remove_pid_file()?;
+    Ok(CommandReport::line(format!(
+        "Service stopped after SIGKILL (PID {pid})"
+    )))
 }
 
-// ----------------------------
-// 停止服务
-// ----------------------------
-pub(super) fn stop_service() -> bool {
-    let pid = match read_pid() {
-        Some(p) => p,
-        None => {
-            println!("Service is not running (no PID file)");
-            return true; // 视为已停止
-        }
-    };
-
-    if !is_process_running(pid) {
-        println!("PID {} is not running. Cleaning up stale PID file.", pid);
-        remove_pid_file();
-        return true;
-    }
-
-    println!("Stopping service (PID {})...", pid);
-
-    // 发送 SIGTERM
-    if let Err(e) = send_terminate_signal(pid) {
-        eprintln!("Failed to send SIGTERM: {}", e);
-        return false;
-    }
-
-    if wait_for_process_exit(pid, DAEMON_STOP_TIMEOUT_SECS) {
-        println!("Service stopped after SIGTERM.");
-        remove_pid_file();
-        return true;
-    }
-
-    // 超时，强制杀死
-    eprintln!("Graceful shutdown timed out. Sending SIGKILL...");
-    let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();
-    thread::sleep(Duration::from_millis(200));
-
-    if !is_process_running(pid) {
-        println!("Service killed forcefully.");
-        remove_pid_file();
-        true
-    } else {
-        eprintln!("ERROR: Failed to kill process {}!", pid);
-        false
-    }
-}
-
-// ----------------------------
-// 重启服务
-// ----------------------------
-pub(super) fn restart_service<D, T>()
-where
-    D: Daemon<T>,
-{
-    println!("Restarting service...");
-    if stop_service() {
-        // 小延迟确保资源释放（可选）
-        thread::sleep(Duration::from_millis(300));
-        println!("Starting new instance...");
-        start_service::<D, T>();
-    } else {
-        eprintln!("Failed to stop service. Restart aborted.");
-    }
-}
-
-// ----------------------------
-// 内部工具函数
-// ----------------------------
-
-fn send_terminate_signal(pid: i32) -> Result<(), std::io::Error> {
-    let status = Command::new("kill")
-        .arg("-TERM")
-        .arg(pid.to_string())
-        .status()
-        .map_err(|e| std::io::Error::other(format!("exec kill: {}", e)))?;
-
-    if status.success() {
+fn send_signal(pid: i32, signal: i32) -> GlobalResult<()> {
+    if unsafe { libc::kill(pid, signal) } == 0 {
         Ok(())
     } else {
-        Err(std::io::Error::other(format!(
-            "kill -TERM {} failed (exit code: {:?})",
-            pid,
-            status.code()
-        )))
+        Err(external_error(std::io::Error::last_os_error()))
     }
 }
 
-fn wait_for_process_exit(pid: i32, timeout_secs: u64) -> bool {
-    let start = Instant::now();
-    let timeout = Duration::from_secs(timeout_secs);
-
-    while start.elapsed() < timeout {
-        if !is_process_running(pid) {
-            return true;
+fn wait_for_process_exit(pid: i32, timeout: Duration) -> GlobalResult<bool> {
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        if !process_exists(pid)? {
+            return Ok(true);
         }
         thread::sleep(Duration::from_millis(200));
     }
-    false
+    Ok(false)
+}
+
+fn daemon_error(message: &str) -> GlobalError {
+    GlobalError::new_sys_error(message, |_| {})
+}
+
+fn external_error<E>(error: E) -> GlobalError
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    GlobalError::from_external_error(error, |_| {})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        format_start_time_friendly, pid_file_path, stop_service_with_timeout,
+        verify_process_identity,
+    };
+    use std::env;
+    use std::fs;
+    use std::process::Command;
+    use std::thread;
+    use std::time::Duration;
+
+    const IGNORE_TERM_HELPER_ENV: &str = "BASE_DAEMON_IGNORE_TERM_HELPER";
+
+    #[test]
+    fn formats_ps_start_time() {
+        assert_eq!(
+            format_start_time_friendly("Thu Dec 4 18:25:03 2025").as_deref(),
+            Some("2025-12-04 18:25:03")
+        );
+    }
+
+    #[test]
+    fn refuses_pid_owned_by_a_different_executable() {
+        let mut child = Command::new("sleep").arg("5").spawn().unwrap();
+        let error = verify_process_identity(child.id() as i32).unwrap_err();
+        assert!(error.to_string().contains("different executable"));
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn sigkill_escalation_is_checked_and_removes_pid_file() {
+        let mut child = Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "daemon::unix::tests::ignore_sigterm_process_helper",
+                "--nocapture",
+            ])
+            .env(IGNORE_TERM_HELPER_ENV, "1")
+            .spawn()
+            .unwrap();
+        thread::sleep(Duration::from_millis(100));
+        fs::write(pid_file_path().unwrap(), child.id().to_string()).unwrap();
+        let reaper = thread::spawn(move || child.wait().unwrap());
+
+        let report = stop_service_with_timeout(Duration::from_millis(100)).unwrap();
+
+        assert!(report.lines[0].contains("SIGKILL"));
+        assert!(!pid_file_path().unwrap().exists());
+        assert!(!reaper.join().unwrap().success());
+    }
+
+    #[test]
+    fn ignore_sigterm_process_helper() {
+        if env::var_os(IGNORE_TERM_HELPER_ENV).is_none() {
+            return;
+        }
+        unsafe {
+            libc::signal(libc::SIGTERM, libc::SIG_IGN);
+        }
+        thread::sleep(Duration::from_secs(30));
+    }
 }

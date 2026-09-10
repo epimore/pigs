@@ -1,6 +1,6 @@
 #[allow(dead_code, unused_imports)]
 mod test1 {
-    use cfg_lib::conf::{init_cfg, CheckFromConf, FieldCheckError};
+    use cfg_lib::conf::{try_init_cfg, CheckFromConf, FieldCheckError};
     use cfg_macro::conf;
     use serde::Deserialize;
     use serde::Deserializer;
@@ -15,8 +15,8 @@ mod test1 {
 
     #[test]
     fn test_default_conf1() {
-        init_cfg("tests/cfg1.yaml".to_string());
-        let conf = Cfg1::conf();
+        try_init_cfg("tests/cfg1.yaml").unwrap();
+        let conf = Cfg1::try_conf().unwrap();
         println!("{:?}", conf);
     }
 
@@ -30,7 +30,7 @@ mod test1 {
 
     #[test]
     fn test_target_conf2() {
-        let conf = Cfg2::conf();
+        let conf = Cfg2::try_conf().unwrap();
         println!("{:?}", conf);
     }
 
@@ -115,40 +115,38 @@ mod test1 {
 
     #[test]
     fn test_prefix_conf() {
-        let conf = Features::conf();
+        let conf = Features::try_conf().unwrap();
         assert_eq!(conf.miss, 0);
         println!("{:?}", conf);
     }
 
     #[test]
-    #[should_panic(expected = "Failed to map YAML value to struct")]
-    fn test_prefix_conf_default_false_should_panic() {
-        let _ = FeaturesNoDefault::conf();
+    fn test_prefix_conf_default_false_returns_error() {
+        assert!(FeaturesNoDefault::try_conf().is_err());
     }
 
     #[test]
-    #[should_panic(expected = "Failed to map YAML value to struct with defaults")]
-    fn test_prefix_conf_missing_without_serde_default_should_panic() {
-        let _ = FeaturesMissingWithoutSerdeDefault::conf();
+    fn test_prefix_conf_missing_without_serde_default_returns_error() {
+        assert!(FeaturesMissingWithoutSerdeDefault::try_conf().is_err());
     }
 
     #[test]
     fn test_prefix_conf_serde_default_priority() {
-        let conf = FeaturesSerdeDefault::conf();
+        let conf = FeaturesSerdeDefault::try_conf().unwrap();
         println!("{:?}", conf);
         assert_eq!(conf.miss, 7);
     }
 
     #[test]
     fn test_prefix_conf_serde_default_with_deserializer() {
-        let conf = FeaturesSerdeDefaultWithDeserializer::conf();
+        let conf = FeaturesSerdeDefaultWithDeserializer::try_conf().unwrap();
         println!("{:?}", conf);
         assert_eq!(conf.level, "info");
     }
 
     #[test]
     fn test_prefix_conf_container_serde_attr() {
-        let conf = FeaturesContainerSerdeAttr::conf();
+        let conf = FeaturesContainerSerdeAttr::try_conf().unwrap();
         println!("{:?}", conf);
         assert_eq!(conf.miss_value, 9);
     }

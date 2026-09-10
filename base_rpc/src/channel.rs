@@ -50,6 +50,7 @@ pub async fn connect_channel(config: &RpcChannelConfig) -> Result<Channel, RpcEr
         .keep_alive_while_idle(config.keep_alive_while_idle);
 
     if let Some(tls) = &config.tls {
+        crate::ensure_crypto_provider()?;
         endpoint = endpoint.tls_config(build_client_tls(tls))?;
     }
 

@@ -2,6 +2,7 @@ pub mod conf;
 pub mod util;
 extern crate cfg_macro;
 pub use cfg_macro::conf;
+pub use clap::ArgMatches;
 
 pub struct CliBasic {
     pub name: &'static str,

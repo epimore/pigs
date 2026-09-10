@@ -8,7 +8,7 @@ use serde::{Deserialize, Deserializer};
 
 use crate::serde_default;
 use cfg_lib::conf;
-use exception::{GlobalResult, GlobalResultExt};
+use exception::{GlobalError, GlobalResult, GlobalResultExt};
 
 pub mod episode;
 
@@ -71,8 +71,10 @@ struct LogRule {
 
 impl Logger {
     pub fn init() -> GlobalResult<()> {
-        let mut log: Logger = Logger::conf();
-        let default_level = level_filter(&log.level);
+        let mut log: Logger =
+            Logger::try_conf().map_err(|error| GlobalError::from_external_error(error, |_| {}))?;
+        let default_level = level_filter(&log.level)
+            .map_err(|error| GlobalError::from_external_error(error, |_| {}))?;
 
         // store_path 逻辑
         let store_path = if log.store_path.as_os_str().is_empty() {
@@ -121,7 +123,12 @@ impl Logger {
         if let Some(specify) = &log.specify {
             for s in specify {
                 let targets = parse_targets(&s.crate_name);
-                let level = s.level.as_deref().map(level_filter);
+                let level = s
+                    .level
+                    .as_deref()
+                    .map(level_filter)
+                    .transpose()
+                    .map_err(|error| GlobalError::from_external_error(error, |_| {}))?;
                 let effective_level = level.unwrap_or(default_level);
 
                 // case ①：独立文件输出
@@ -236,15 +243,26 @@ fn match_target(target: &str, rules: &[String]) -> bool {
     })
 }
 
-pub fn level_filter(level: &str) -> LevelFilter {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidLogLevel;
+
+impl std::fmt::Display for InvalidLogLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("invalid log level")
+    }
+}
+
+impl std::error::Error for InvalidLogLevel {}
+
+pub fn level_filter(level: &str) -> Result<LevelFilter, InvalidLogLevel> {
     match level.trim().to_uppercase().as_str() {
-        "OFF" => LevelFilter::Off,
-        "ERROR" => LevelFilter::Error,
-        "WARN" => LevelFilter::Warn,
-        "INFO" => LevelFilter::Info,
-        "DEBUG" => LevelFilter::Debug,
-        "TRACE" => LevelFilter::Trace,
-        _ => panic!("The log level is invalid"),
+        "OFF" => Ok(LevelFilter::Off),
+        "ERROR" => Ok(LevelFilter::Error),
+        "WARN" => Ok(LevelFilter::Warn),
+        "INFO" => Ok(LevelFilter::Info),
+        "DEBUG" => Ok(LevelFilter::Debug),
+        "TRACE" => Ok(LevelFilter::Trace),
+        _ => Err(InvalidLogLevel),
     }
 }
 
@@ -253,7 +271,7 @@ where
     D: Deserializer<'de>,
 {
     let level = String::deserialize(deserializer)?;
-    level_filter(&level);
+    level_filter(&level).map_err(serde::de::Error::custom)?;
     Ok(level)
 }
 
@@ -263,7 +281,7 @@ where
 {
     let level = Option::<String>::deserialize(deserializer)?;
     if let Some(level) = &level {
-        level_filter(level);
+        level_filter(level).map_err(serde::de::Error::custom)?;
     }
     Ok(level)
 }
@@ -272,7 +290,9 @@ where
 mod tests {
     use log::LevelFilter;
 
-    use super::{display_source_file, effective_level, parse_targets, LogRule, Logger};
+    use super::{
+        display_source_file, effective_level, level_filter, parse_targets, LogRule, Logger,
+    };
 
     #[test]
     fn file_output_defaults_to_enabled() {
@@ -288,6 +308,13 @@ mod tests {
 
         assert!(!logger.file);
         assert!(logger.stdout);
+    }
+
+    #[test]
+    fn invalid_log_level_is_rejected_without_panicking() {
+        assert!(level_filter("verbose").is_err());
+        let error = serde_yaml::from_str::<Logger>("level: verbose\n").unwrap_err();
+        assert!(error.to_string().contains("invalid log level"));
     }
 
     #[test]

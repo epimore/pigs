@@ -39,15 +39,29 @@ fn build_register_constructor(attr: &ConAttr, struct_name: &Ident) -> proc_macro
         return quote! {};
     }
 
+    let cfg_lib_path = match &attr.lib {
+        None => quote! { base::cfg_lib },
+        Some(lib) if !lib.is_empty() => {
+            let lib_path: syn::Path = syn::parse_str(lib).expect("parse lib path failed");
+            quote! { #lib_path::cfg_lib }
+        }
+        _ => quote! { cfg_lib },
+    };
     let check = if attr.check {
         quote! {
-            #struct_name::conf()._field_check()
+            #struct_name::try_conf().and_then(|config| {
+                config._field_check().map_err(|error| {
+                    #cfg_lib_path::conf::ConfigError::validation(
+                        std::any::type_name::<#struct_name>(),
+                        error,
+                    )
+                })
+            })
         }
     } else {
         quote! {
             {
-                let _ = #struct_name::conf();
-                Ok(())
+                #struct_name::try_conf().map(|_| ())
             }
         }
     };
@@ -87,6 +101,14 @@ fn build_conf_constructor(attr: ConAttr, ast: &DeriveInput) -> proc_macro2::Toke
     let fn_body_prefix;
     let fn_body_data_type;
     let fn_body_use_lib;
+    let fn_error_type = match &attr.lib {
+        None => quote! { base::cfg_lib },
+        Some(lib) if !lib.is_empty() => {
+            let lib_path: syn::Path = syn::parse_str(lib).expect("parse lib path failed");
+            quote! { #lib_path::cfg_lib }
+        }
+        _ => quote! { cfg_lib },
+    };
 
     match attr.lib {
         None => {
@@ -115,17 +137,26 @@ fn build_conf_constructor(attr: ConAttr, ast: &DeriveInput) -> proc_macro2::Toke
     match attr.path {
         None => {
             fn_body_path = quote! {
-                let yaml_content = cfg_lib::conf::get_config();
+                let yaml_content = cfg_lib::conf::try_get_config()?;
                 let yaml_value: serde_yaml::Value = serde_yaml::from_str(&yaml_content)
-                    .expect("Failed to parse YAML content");
+                    .map_err(|error| cfg_lib::conf::ConfigError::parse(
+                        std::any::type_name::<Self>(),
+                        error,
+                    ))?;
             };
         }
         Some(path) => {
             fn_body_path = quote! {
                 let yaml_content = std::fs::read_to_string(#path)
-                    .expect("Failed to read YAML file");
+                    .map_err(|error| cfg_lib::conf::ConfigError::parse(
+                        std::any::type_name::<Self>(),
+                        error,
+                    ))?;
                 let yaml_value: serde_yaml::Value = serde_yaml::from_str(&yaml_content)
-                    .expect("Failed to parse YAML");
+                    .map_err(|error| cfg_lib::conf::ConfigError::parse(
+                        std::any::type_name::<Self>(),
+                        error,
+                    ))?;
             };
         }
     }
@@ -143,9 +174,19 @@ fn build_conf_constructor(attr: ConAttr, ast: &DeriveInput) -> proc_macro2::Toke
                     if let serde_yaml::Value::Mapping(map) = target_value {
                         target_value = map
                             .get(&serde_yaml::Value::String(key.to_string()))
-                            .expect("Specified prefix not found in YAML");
+                            .ok_or_else(|| cfg_lib::conf::ConfigError::validation(
+                                std::any::type_name::<Self>(),
+                                cfg_lib::conf::FieldCheckError::BizError(
+                                    format!("required configuration section {key} is missing")
+                                ),
+                            ))?;
                     } else {
-                        panic!("Invalid YAML structure for the specified prefix");
+                        return Err(cfg_lib::conf::ConfigError::validation(
+                            std::any::type_name::<Self>(),
+                            cfg_lib::conf::FieldCheckError::BizError(
+                                format!("configuration section {key} has an invalid structure")
+                            ),
+                        ));
                     }
                 }
             };
@@ -159,7 +200,10 @@ fn build_conf_constructor(attr: ConAttr, ast: &DeriveInput) -> proc_macro2::Toke
             } else {
                 fn_body_data_type = quote! {
                     serde_yaml::from_value(target_value.clone())
-                        .expect("Failed to map YAML value to struct")
+                        .map_err(|error| cfg_lib::conf::ConfigError::parse(
+                            std::any::type_name::<Self>(),
+                            error,
+                        ))?
                 };
             }
         }
@@ -169,11 +213,17 @@ fn build_conf_constructor(attr: ConAttr, ast: &DeriveInput) -> proc_macro2::Toke
     }
 
     quote! {
-        fn conf() -> Self {
+        #[allow(clippy::needless_question_mark)]
+        pub fn try_conf() -> Result<Self, #fn_error_type::conf::ConfigError> {
             #fn_body_use_lib
             #fn_body_path
             #fn_body_prefix
-            #fn_body_data_type
+            Ok(#fn_body_data_type)
+        }
+
+        #[deprecated(note = "use try_conf")]
+        fn conf() -> Self {
+            Self::try_conf().expect("load typed service configuration failed")
         }
     }
 }
@@ -213,7 +263,7 @@ fn build_default_data_type(ast: &DeriveInput) -> proc_macro2::TokenStream {
         }
     });
 
-    quote! {
+    quote! {{
         #[derive(serde::Deserialize)]
         #(#struct_serde_attrs)*
         struct #proxy_name {
@@ -221,12 +271,15 @@ fn build_default_data_type(ast: &DeriveInput) -> proc_macro2::TokenStream {
         }
 
         let __cfg_proxy: #proxy_name = serde_yaml::from_value(target_value.clone())
-            .expect("Failed to map YAML value to struct with defaults");
+            .map_err(|error| cfg_lib::conf::ConfigError::parse(
+                std::any::type_name::<Self>(),
+                error,
+            ))?;
 
         Self {
             #(#assign_fields,)*
         }
-    }
+    }}
 }
 
 fn parse_attr(attrs: TokenStream) -> ConAttr {

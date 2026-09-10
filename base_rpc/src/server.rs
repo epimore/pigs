@@ -47,6 +47,7 @@ pub fn build_server(config: &RpcServerConfig) -> Result<Server, RpcError> {
         .http2_keepalive_timeout(config.http2_keepalive_timeout);
 
     if let Some(tls) = &config.tls {
+        crate::ensure_crypto_provider()?;
         server = server.tls_config(build_server_tls(tls))?;
     }
 

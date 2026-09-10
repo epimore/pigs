@@ -3,16 +3,10 @@ pub mod signal;
 mod unix;
 
 use cfg_lib::CliBasic;
-use exception::GlobalResult;
-use serde::{Deserialize, Serialize};
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::path::PathBuf;
+use exception::{GlobalError, GlobalResult};
 use std::process;
 use std::sync::Once;
-use std::{env, fs};
 
-//todo 优化，运行前检查是否已有进程运行：当前即使未再次运行成功也会重写meta数据
 pub trait Daemon<T> {
     fn cli_basic() -> CliBasic;
     fn init_privilege() -> GlobalResult<(Self, T)>
@@ -50,45 +44,100 @@ pub fn install_sanitized_panic_hook() {
     });
 }
 
-fn run_foreground<D, T>() -> Result<(), String>
+fn run_foreground<D, T>() -> GlobalResult<()>
 where
     D: Daemon<T>,
 {
-    let (daemon, bootstrap) =
-        D::init_privilege().map_err(|error| format!("App init error: {error}"))?;
-    daemon
-        .run_app(bootstrap)
-        .map_err(|error| format!("App runtime error: {error}"))
+    let (daemon, bootstrap) = D::init_privilege()?;
+    daemon.run_app(bootstrap)
 }
 
-#[derive(Serialize, Deserialize)]
-struct DaemonMeta {
-    config_path: String,
-    daemon: bool,
+#[derive(Debug, Default)]
+pub(super) struct CommandReport {
+    lines: Vec<String>,
 }
-impl DaemonMeta {
-    fn get_meta_file_path() -> PathBuf {
-        let exe_path = env::current_exe().expect("Failed to get current exe path");
-        exe_path.with_extension("meta")
+
+impl CommandReport {
+    pub(super) fn line(line: impl Into<String>) -> Self {
+        Self {
+            lines: vec![line.into()],
+        }
     }
 
-    fn save_meta(&self) {
-        let meta_path = Self::get_meta_file_path();
-        let content = serde_json::to_string(self).expect("Failed to serialize meta");
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(meta_path)
-            .expect("Failed to open meta file");
-        file.write_all(content.as_bytes())
-            .expect("Failed to write meta");
+    pub(super) fn push(&mut self, line: impl Into<String>) {
+        self.lines.push(line.into());
     }
+}
 
-    fn load_meta() -> Self {
-        let meta_path = Self::get_meta_file_path();
-        let content = fs::read_to_string(meta_path).expect("Failed to read meta file");
-        serde_json::from_str(&content).expect("Failed to deserialize meta")
+fn config_path(args: &cfg_lib::ArgMatches) -> GlobalResult<String> {
+    args.try_get_one::<String>("config")
+        .map_err(|error| GlobalError::from_external_error(error, |_| {}))?
+        .cloned()
+        .ok_or_else(|| daemon_error("configuration path is missing"))
+}
+
+fn init_config(path: &str) -> GlobalResult<()> {
+    cfg_lib::conf::try_init_cfg(path)
+        .map_err(|error| GlobalError::from_external_error(error, |_| {}))
+}
+
+fn run_command<D, T>(arg_matches: &cfg_lib::ArgMatches) -> GlobalResult<CommandReport>
+where
+    D: Daemon<T>,
+{
+    match arg_matches.subcommand() {
+        Some(("start", args)) => {
+            init_config(&config_path(args)?)?;
+            let daemon = args.get_flag("daemon");
+            if daemon && (cfg!(target_os = "linux") || cfg!(target_os = "macos")) {
+                #[cfg(unix)]
+                {
+                    return unix::start_service::<D, T>();
+                }
+            }
+            if daemon {
+                return Err(daemon_error("daemon mode only supports macOS and Linux"));
+            }
+            run_foreground::<D, T>()?;
+            Ok(CommandReport::default())
+        }
+        Some(("stop", _)) => {
+            #[cfg(unix)]
+            {
+                unix::stop_service()
+            }
+            #[cfg(not(unix))]
+            {
+                Err(daemon_error("daemon mode only supports macOS and Linux"))
+            }
+        }
+        Some(("restart", args)) => {
+            #[cfg(unix)]
+            {
+                let config_path = config_path(args)?;
+                unix::stop_service()?;
+                init_config(&config_path)?;
+                unix::start_service::<D, T>()
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = args;
+                Err(daemon_error("daemon mode only supports macOS and Linux"))
+            }
+        }
+        Some(("status", _)) => {
+            #[cfg(unix)]
+            {
+                unix::status_service()
+            }
+            #[cfg(not(unix))]
+            {
+                Err(daemon_error("service status only supports macOS and Linux"))
+            }
+        }
+        _ => Err(daemon_error(
+            "a service command is required: start, stop, restart, or status",
+        )),
     }
 }
 
@@ -97,89 +146,38 @@ where
     D: Daemon<T>,
 {
     install_sanitized_panic_hook();
-    let app_info = D::cli_basic();
-    let arg_matches = cfg_lib::conf::get_arg_cmd(app_info);
-    match arg_matches.subcommand() {
-        Some(("start", args)) => {
-            let config_path = args
-                .try_get_one::<String>("config")
-                .expect("get config failed")
-                .expect("not found config")
-                .to_string();
-            cfg_lib::conf::init_cfg(config_path.clone());
-            let daemon = args.get_flag("daemon");
-            let meta = DaemonMeta {
-                config_path,
-                daemon,
-            };
-            meta.save_meta();
-            if daemon && (cfg!(target_os = "linux") || cfg!(target_os = "macos")) {
-                #[cfg(unix)]
-                {
-                    unix::start_service::<D, T>();
-                }
-                return;
-            }
-            if daemon {
-                eprintln!("The daemon only supports macOS, and Linux");
-            }
-            if let Err(error) = run_foreground::<D, T>() {
-                eprintln!("{error}");
-                process::exit(1);
+    let command = cfg_lib::conf::command(D::cli_basic());
+    let matches = match command.try_get_matches_from(std::env::args_os()) {
+        Ok(matches) => matches,
+        Err(error) => {
+            let exit_code = error.exit_code();
+            let _ = error.print();
+            process::exit(exit_code);
+        }
+    };
+    let result = run_command::<D, T>(&matches);
+    match result {
+        Ok(report) => {
+            for line in report.lines {
+                println!("{line}");
             }
         }
-        Some(("stop", _)) => {
-            let daemon_meta = DaemonMeta::load_meta();
-            if daemon_meta.daemon {
-                if cfg!(target_os = "linux") || cfg!(target_os = "macos") {
-                    #[cfg(unix)]
-                    {
-                        unix::stop_service();
-                    }
-                } else {
-                    eprintln!("The daemon only supports macOS, and Linux");
-                }
-            } else {
-                eprintln!("Not running daemon mode");
-            }
-        }
-        Some(("restart", _)) => {
-            let daemon_meta = DaemonMeta::load_meta();
-            if daemon_meta.daemon {
-                let config_path = daemon_meta.config_path;
-                cfg_lib::conf::init_cfg(config_path);
-                if cfg!(target_os = "linux") || cfg!(target_os = "macos") {
-                    #[cfg(unix)]
-                    {
-                        unix::restart_service::<D, T>();
-                    }
-                } else {
-                    eprintln!("The daemon only supports macOS, and Linux");
-                }
-            } else {
-                eprintln!("Not running daemon mode");
-            }
-        }
-        Some(("status", _)) => {
-            if cfg!(target_os = "linux") || cfg!(target_os = "macos") {
-                #[cfg(unix)]
-                {
-                    unix::status_service();
-                }
-            } else {
-                eprintln!("The status only supports macOS, and Linux");
-            }
-        }
-        _other => {
-            eprintln!("Please add subcommands to operate: [start|stop|restart]")
+        Err(error) => {
+            eprintln!("service command failed: {error}");
+            process::exit(1);
         }
     }
+}
+
+fn daemon_error(message: &str) -> GlobalError {
+    GlobalError::new_sys_error(message, |_| {})
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use exception::GlobalError;
+    use std::env;
     use std::process::Command;
 
     const PANIC_HELPER_ENV: &str = "BASE_SANITIZED_PANIC_HELPER";
@@ -221,11 +219,11 @@ mod tests {
 
     #[test]
     fn foreground_init_error_preserves_diagnostics_without_source_path() {
-        let error = run_foreground::<InitFailure, ()>().unwrap_err();
+        let error = run_foreground::<InitFailure, ()>().unwrap_err().to_string();
 
         assert_eq!(
             error,
-            "App init error: bind session grpc 127.0.0.1:19081 failed: Address already in use (os error 98)"
+            "bind session grpc 127.0.0.1:19081 failed: Address already in use (os error 98)"
         );
         assert!(!error.contains(env!("CARGO_MANIFEST_DIR")));
     }
@@ -233,9 +231,36 @@ mod tests {
     #[test]
     fn foreground_runtime_error_is_returned_instead_of_panicking() {
         assert_eq!(
-            run_foreground::<RuntimeFailure, ()>().unwrap_err(),
-            "App runtime error: runtime stopped"
+            run_foreground::<RuntimeFailure, ()>()
+                .unwrap_err()
+                .to_string(),
+            "runtime stopped"
         );
+    }
+
+    #[test]
+    fn restart_uses_default_or_explicit_config_without_meta_state() {
+        let default = cfg_lib::conf::command(CliBasic {
+            name: "test-service",
+            version: "1",
+            author: "test",
+            about: "test",
+        })
+        .try_get_matches_from(["test-service", "restart"])
+        .unwrap();
+        let (_, args) = default.subcommand().unwrap();
+        assert_eq!(config_path(args).unwrap(), "./config.yml");
+
+        let explicit = cfg_lib::conf::command(CliBasic {
+            name: "test-service",
+            version: "1",
+            author: "test",
+            about: "test",
+        })
+        .try_get_matches_from(["test-service", "restart", "-c", "custom.yml"])
+        .unwrap();
+        let (_, args) = explicit.subcommand().unwrap();
+        assert_eq!(config_path(args).unwrap(), "custom.yml");
     }
 
     #[test]

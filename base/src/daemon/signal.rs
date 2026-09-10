@@ -1,3 +1,4 @@
+use exception::{GlobalError, GlobalResult};
 use log::debug;
 use once_cell::sync::Lazy;
 use tokio::signal;
@@ -34,37 +35,40 @@ impl Signal {
     }
 
     /// 此函数在程序生命周期只调用一次
-    pub async fn wait_exit_signal() -> ExitSignal {
+    pub async fn wait_exit_signal() -> GlobalResult<ExitSignal> {
         // 监听 Ctrl+C
         let ctrl_c = async {
-            signal::ctrl_c()
-                .await
-                .expect("Failed to install Ctrl+C handler");
+            signal::ctrl_c().await.map_err(signal_error)?;
             debug!("收到 Ctrl+C 信号");
-            ExitSignal::CtrlC
+            Ok(ExitSignal::CtrlC)
         };
 
         #[cfg(unix)]
         let terminate = async {
-            signal::unix::signal(signal::unix::SignalKind::terminate())
-                .expect("Failed to install signal handler")
-                .recv()
-                .await;
+            let mut signal = signal::unix::signal(signal::unix::SignalKind::terminate())
+                .map_err(signal_error)?;
+            signal.recv().await;
             debug!("收到 TERM 信号");
-            ExitSignal::Terminate
+            Ok(ExitSignal::Terminate)
         };
 
         #[cfg(not(unix))]
-        let terminate = std::future::pending::<ExitSignal>();
+        let terminate = std::future::pending::<GlobalResult<ExitSignal>>();
 
         let signal = tokio::select! {
-            _ = SHUTDOWN.cancelled() => ExitSignal::Requested,
+            _ = SHUTDOWN.cancelled() => Ok(ExitSignal::Requested),
             signal = ctrl_c => signal,
             signal = terminate => signal,
         };
-        SHUTDOWN.cancel();
+        if signal.is_ok() {
+            SHUTDOWN.cancel();
+        }
         signal
     }
+}
+
+fn signal_error(error: std::io::Error) -> GlobalError {
+    GlobalError::from_external_error(error, |_| {})
 }
 
 #[cfg(all(test, unix))]
@@ -80,7 +84,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
             let status = unsafe { libc::kill(std::process::id() as i32, libc::SIGTERM) };
             assert_eq!(status, 0);
-            assert_eq!(waiter.await.expect("signal waiter"), ExitSignal::Terminate);
+            assert_eq!(
+                waiter.await.expect("signal waiter").expect("signal result"),
+                ExitSignal::Terminate
+            );
         });
     }
 }

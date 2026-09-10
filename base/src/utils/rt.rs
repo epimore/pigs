@@ -688,7 +688,14 @@ fn create_runtime(runtime_type: &RuntimeType, threads: Option<usize>) -> GlobalR
 
 async fn wait_for_exit_signal(shutdown_requested: CancellationToken) -> ExitSignal {
     tokio::select! {
-        signal = Signal::wait_exit_signal() => signal,
+        signal = Signal::wait_exit_signal() => match signal {
+            Ok(signal) => signal,
+            Err(error) => {
+                error!("install process signal handler failed: {error}");
+                GlobalRuntime::request_shutdown_with_error();
+                ExitSignal::Requested
+            }
+        },
         _ = shutdown_requested.cancelled() => ExitSignal::Requested,
     }
 }
