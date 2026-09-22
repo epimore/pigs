@@ -30,6 +30,14 @@ pub struct VerifiedArtifactRequest {
     pub public_key: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
+pub struct HashVerifiedArtifactRequest {
+    pub url: String,
+    pub output_name: String,
+    pub expected_size: u64,
+    pub expected_sha256: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StagedArtifact {
     pub path: PathBuf,
@@ -86,6 +94,30 @@ pub async fn download_verify_and_stage(
     policy: &ArtifactDownloadPolicy,
     cancel: CancellationToken,
 ) -> Result<StagedArtifact, ArtifactError> {
+    let hash_request = request.hash_request();
+    download_and_stage(
+        &hash_request,
+        policy,
+        cancel,
+        Some((&request.public_key, &request.signature)),
+    )
+    .await
+}
+
+pub async fn download_verify_hash_and_stage(
+    request: &HashVerifiedArtifactRequest,
+    policy: &ArtifactDownloadPolicy,
+    cancel: CancellationToken,
+) -> Result<StagedArtifact, ArtifactError> {
+    download_and_stage(request, policy, cancel, None).await
+}
+
+async fn download_and_stage(
+    request: &HashVerifiedArtifactRequest,
+    policy: &ArtifactDownloadPolicy,
+    cancel: CancellationToken,
+    signature: Option<(&[u8], &[u8])>,
+) -> Result<StagedArtifact, ArtifactError> {
     validate_request(request, policy)?;
     std::fs::create_dir_all(&policy.staging_root)
         .map_err(|error| io_error("create staging root", error))?;
@@ -95,17 +127,24 @@ pub async fn download_verify_and_stage(
         .map_err(|error| io_error("resolve staging root", error))?;
     let destination = root.join(&request.output_name);
     if destination.exists() {
-        return verify_existing(&destination, request).await;
+        let staged = verify_existing_hash(&destination, request).await?;
+        if let Some((public_key, signature)) = signature {
+            verify_file_signature(&destination, public_key, signature).await?;
+        }
+        return Ok(staged);
     }
     let temporary = root.join(format!(
         ".{}.{}.partial",
         request.output_name,
         random_suffix()
     ));
-    let result = match tokio::time::timeout(
-        policy.total_timeout,
-        download_to_temporary(request, policy, &temporary, cancel),
-    )
+    let result = match tokio::time::timeout(policy.total_timeout, async {
+        let staged = download_to_temporary(request, policy, &temporary, cancel).await?;
+        if let Some((public_key, signature)) = signature {
+            verify_file_signature(&temporary, public_key, signature).await?;
+        }
+        Ok(staged)
+    })
     .await
     {
         Ok(result) => result,
@@ -124,45 +163,78 @@ pub async fn download_verify_and_stage(
             return Err(error);
         }
     };
-    tokio::fs::rename(&temporary, &destination)
-        .await
-        .map_err(|error| io_error("atomically stage artifact", error))?;
+    if let Err(error) = tokio::fs::rename(&temporary, &destination).await {
+        remove_partial(&temporary).await;
+        return Err(io_error("atomically stage artifact", error));
+    }
     Ok(StagedArtifact {
         path: destination,
         ..staged
     })
 }
 
-async fn verify_existing(
+impl VerifiedArtifactRequest {
+    fn hash_request(&self) -> HashVerifiedArtifactRequest {
+        HashVerifiedArtifactRequest {
+            url: self.url.clone(),
+            output_name: self.output_name.clone(),
+            expected_size: self.expected_size,
+            expected_sha256: self.expected_sha256.clone(),
+        }
+    }
+}
+
+async fn verify_existing_hash(
     destination: &Path,
-    request: &VerifiedArtifactRequest,
+    request: &HashVerifiedArtifactRequest,
 ) -> Result<StagedArtifact, ArtifactError> {
-    let bytes = tokio::fs::read(destination)
+    use tokio::io::AsyncReadExt;
+
+    let mut file = tokio::fs::File::open(destination)
         .await
-        .map_err(|error| io_error("read existing staged artifact", error))?;
-    if bytes.len() as u64 != request.expected_size {
+        .map_err(|error| io_error("open existing staged artifact", error))?;
+    let mut buffer = [0u8; 64 * 1024];
+    let mut hasher = Sha256::new();
+    let mut size = 0u64;
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .await
+            .map_err(|error| io_error("read existing staged artifact", error))?;
+        if read == 0 {
+            break;
+        }
+        size = size.saturating_add(read as u64);
+        if size > request.expected_size {
+            return Err(ArtifactError::new(
+                ArtifactErrorKind::Integrity,
+                "existing artifact size does not match manifest",
+            ));
+        }
+        hasher.update(&buffer[..read]);
+    }
+    if size != request.expected_size {
         return Err(ArtifactError::new(
             ArtifactErrorKind::Integrity,
             "existing artifact size does not match manifest",
         ));
     }
-    let digest = format!("{:x}", Sha256::digest(&bytes));
+    let digest = format!("{:x}", hasher.finalize());
     if !digest.eq_ignore_ascii_case(&request.expected_sha256) {
         return Err(ArtifactError::new(
             ArtifactErrorKind::Integrity,
             "existing artifact SHA-256 does not match manifest",
         ));
     }
-    verify_ed25519(&bytes, &request.public_key, &request.signature)?;
     Ok(StagedArtifact {
         path: destination.to_path_buf(),
-        size: request.expected_size,
+        size,
         sha256: digest,
     })
 }
 
 async fn download_to_temporary(
-    request: &VerifiedArtifactRequest,
+    request: &HashVerifiedArtifactRequest,
     policy: &ArtifactDownloadPolicy,
     temporary: &Path,
     cancel: CancellationToken,
@@ -237,7 +309,6 @@ async fn download_to_temporary(
             "artifact SHA-256 does not match manifest",
         ));
     }
-    verify_file_signature(temporary, &request.public_key, &request.signature).await?;
     Ok(StagedArtifact {
         path: PathBuf::new(),
         size,
@@ -288,7 +359,7 @@ pub fn verify_ed25519(
 }
 
 fn validate_request(
-    request: &VerifiedArtifactRequest,
+    request: &HashVerifiedArtifactRequest,
     policy: &ArtifactDownloadPolicy,
 ) -> Result<(), ArtifactError> {
     if policy.max_bytes == 0 || policy.total_timeout.is_zero() || request.expected_size == 0 {
@@ -410,6 +481,15 @@ mod tests {
         }
     }
 
+    fn hash_request(url: String, body: &[u8]) -> HashVerifiedArtifactRequest {
+        HashVerifiedArtifactRequest {
+            url,
+            output_name: "model.gmvp".to_string(),
+            expected_size: body.len() as u64,
+            expected_sha256: format!("{:x}", Sha256::digest(body)),
+        }
+    }
+
     #[test]
     fn verifies_detached_ed25519_signature_and_rejects_mutation() {
         let key = SigningKey::from_bytes(&[7u8; 32]);
@@ -451,7 +531,9 @@ mod tests {
             public_key: vec![0; 32],
         };
         assert_eq!(
-            validate_request(&request, &policy).unwrap_err().kind(),
+            validate_request(&request.hash_request(), &policy)
+                .unwrap_err()
+                .kind(),
             ArtifactErrorKind::InvalidConfiguration
         );
     }
@@ -494,6 +576,236 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(error.kind(), ArtifactErrorKind::Timeout);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn hash_only_download_and_existing_replay_are_verified() {
+        let root = std::env::temp_dir().join(format!("artifact-{}", random_suffix()));
+        let body = b"model-bundle";
+        let url = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\n",
+            body,
+            Duration::ZERO,
+        )
+        .await;
+        let request = hash_request(url, body);
+        let policy = loopback_policy(root.clone(), Duration::from_secs(1));
+
+        let staged = download_verify_hash_and_stage(&request, &policy, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(staged.size, body.len() as u64);
+
+        let replay = download_verify_hash_and_stage(&request, &policy, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(replay, staged);
+
+        tokio::fs::write(&staged.path, b"tampered!!!")
+            .await
+            .unwrap();
+        assert_eq!(
+            download_verify_hash_and_stage(&request, &policy, CancellationToken::new())
+                .await
+                .unwrap_err()
+                .kind(),
+            ArtifactErrorKind::Integrity
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn hash_only_rejects_body_size_and_digest_mismatch_and_cleans_partials() {
+        for (head, body, expected, kind) in [
+            (
+                "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n",
+                &b"12345678"[..],
+                &b"1234"[..],
+                ArtifactErrorKind::TooLarge,
+            ),
+            (
+                "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n",
+                &b"1234"[..],
+                &b"12345678"[..],
+                ArtifactErrorKind::Integrity,
+            ),
+            (
+                "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n",
+                &b"1234"[..],
+                &b"5678"[..],
+                ArtifactErrorKind::Integrity,
+            ),
+        ] {
+            let root = std::env::temp_dir().join(format!("artifact-{}", random_suffix()));
+            let url = serve_once(head, body, Duration::ZERO).await;
+            let request = hash_request(url, expected);
+            let error = download_verify_hash_and_stage(
+                &request,
+                &loopback_policy(root.clone(), Duration::from_secs(1)),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.kind(), kind);
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+            std::fs::remove_dir(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn hash_only_rejects_redirect_disallowed_host_and_scheme() {
+        let root = std::env::temp_dir().join(format!("artifact-{}", random_suffix()));
+        let policy = loopback_policy(root.clone(), Duration::from_secs(1));
+        for (url, kind) in [
+            (
+                "https://untrusted.example/artifact",
+                ArtifactErrorKind::Denied,
+            ),
+            (
+                "http://untrusted.example/artifact",
+                ArtifactErrorKind::Denied,
+            ),
+        ] {
+            let error = download_verify_hash_and_stage(
+                &hash_request(url.to_string(), b"x"),
+                &policy,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.kind(), kind);
+        }
+        let mut https_only = policy.clone();
+        https_only.allow_loopback_http = false;
+        let error = download_verify_hash_and_stage(
+            &hash_request("http://127.0.0.1/artifact".to_string(), b"x"),
+            &https_only,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), ArtifactErrorKind::Denied);
+        let url = serve_once(
+            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1/other\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            b"",
+            Duration::ZERO,
+        )
+        .await;
+        let error = download_verify_hash_and_stage(
+            &hash_request(url, b"x"),
+            &policy,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), ArtifactErrorKind::Network);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn hash_only_timeout_and_cancellation_remove_partials() {
+        for cancelled in [false, true] {
+            let root = std::env::temp_dir().join(format!("artifact-{}", random_suffix()));
+            let url = serve_once(
+                "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n",
+                b"12345678",
+                Duration::from_millis(200),
+            )
+            .await;
+            let cancel = CancellationToken::new();
+            if cancelled {
+                let token = cancel.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    token.cancel();
+                });
+            }
+            let error = download_verify_hash_and_stage(
+                &hash_request(url, b"12345678"),
+                &loopback_policy(
+                    root.clone(),
+                    Duration::from_millis(if cancelled { 500 } else { 30 }),
+                ),
+                cancel,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                if cancelled {
+                    ArtifactErrorKind::Cancelled
+                } else {
+                    ArtifactErrorKind::Timeout
+                }
+            );
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+            std::fs::remove_dir(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn signed_download_still_verifies_before_publish_and_replays() {
+        let root = std::env::temp_dir().join(format!("artifact-{}", random_suffix()));
+        let body = b"artifact";
+        let url = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n",
+            body,
+            Duration::ZERO,
+        )
+        .await;
+        let key = SigningKey::from_bytes(&[9u8; 32]);
+        let mut request = request(url, body.len() as u64);
+        request.expected_sha256 = format!("{:x}", Sha256::digest(body));
+        request.public_key = key.verifying_key().to_bytes().to_vec();
+        request.signature = key.sign(body).to_bytes().to_vec();
+        let policy = loopback_policy(root.clone(), Duration::from_secs(1));
+        let staged = download_verify_and_stage(&request, &policy, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&staged.path).unwrap(), body);
+        assert_eq!(
+            download_verify_and_stage(&request, &policy, CancellationToken::new())
+                .await
+                .unwrap(),
+            staged
+        );
+        request.signature = key.sign(b"different").to_bytes().to_vec();
+        assert_eq!(
+            download_verify_and_stage(&request, &policy, CancellationToken::new())
+                .await
+                .unwrap_err()
+                .kind(),
+            ArtifactErrorKind::Signature
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn signed_download_does_not_publish_before_signature_verification() {
+        let root = std::env::temp_dir().join(format!("artifact-{}", random_suffix()));
+        let body = b"artifact";
+        let url = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n",
+            body,
+            Duration::ZERO,
+        )
+        .await;
+        let mut request = request(url, body.len() as u64);
+        request.expected_sha256 = format!("{:x}", Sha256::digest(body));
+        let key = SigningKey::from_bytes(&[9u8; 32]);
+        request.public_key = key.verifying_key().to_bytes().to_vec();
+        request.signature = key.sign(b"different artifact").to_bytes().to_vec();
+        let error = download_verify_and_stage(
+            &request,
+            &loopback_policy(root.clone(), Duration::from_secs(1)),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), ArtifactErrorKind::Signature);
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
         std::fs::remove_dir(root).unwrap();
     }
